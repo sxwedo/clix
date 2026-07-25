@@ -40,7 +40,7 @@ pub struct ReadArgs {
     #[arg(long)]
     pub ct0: Option<String>,
 
-    /// Output file path (default: <author_handle>_<tweet_id>.md)
+    /// Output file path (default: <author_handle>_<title>.md)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
@@ -371,7 +371,8 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
 
-    let full_text = extract_full_text(target);
+    let media_urls = extract_media_urls(target);
+    let full_text = extract_full_text(target, &media_urls);
 
     let created_at = target
         .pointer("/legacy/created_at")
@@ -379,7 +380,6 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
         .unwrap_or("")
         .to_string();
 
-    let media_urls = extract_media_urls(target);
     let tweet_type = if article_title.is_some() || target.pointer("/article").is_some() {
         "Article".to_string()
     } else if target.pointer("/note_tweet").is_some() {
@@ -406,12 +406,35 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
     })
 }
 
-fn extract_full_text(target: &Value) -> String {
+fn extract_full_text(target: &Value, media_urls: &[String]) -> String {
+    // Build media_map: media_id -> original_img_url
+    let mut media_map: HashMap<String, String> = HashMap::new();
+    let article_target = target
+        .pointer("/article/article_results/result")
+        .unwrap_or(target);
+
+    if let Some(media_entities) = article_target
+        .get("media_entities")
+        .and_then(|v| v.as_array())
+    {
+        for m in media_entities {
+            let media_id = m.get("media_id").and_then(|v| v.as_str());
+            let img_url = m
+                .pointer("/media_info/original_img_url")
+                .or_else(|| m.get("media_url_https"))
+                .and_then(|v| v.as_str());
+
+            if let (Some(id), Some(url)) = (media_id, img_url) {
+                media_map.insert(id.to_string(), url.to_string());
+            }
+        }
+    }
+
     // 1. Try rendering from Article content_state (Draft.js AST)
     if let Some(content_state) = target
         .pointer("/article/article_results/result/content_state")
         .or_else(|| target.pointer("/article/content_state"))
-        && let Some(rich_text) = render_content_state(content_state)
+        && let Some(rich_text) = render_content_state(content_state, &media_map)
         && !rich_text.trim().is_empty()
     {
         return rich_text;
@@ -445,20 +468,33 @@ fn extract_full_text(target: &Value) -> String {
     }
 
     // 4. Fallback to legacy full_text
-    target
+    let mut legacy_text = target
         .pointer("/legacy/full_text")
         .and_then(|v| v.as_str())
         .unwrap_or("")
-        .to_string()
+        .to_string();
+
+    // If media exists but is not in text, append image tags
+    if !media_urls.is_empty() && !legacy_text.contains("![Image") {
+        for url in media_urls {
+            legacy_text.push_str(&format!("\n\n![Image]({url})"));
+        }
+    }
+
+    legacy_text
 }
 
-fn render_content_state(cs: &Value) -> Option<String> {
+fn render_content_state(cs: &Value, media_map: &HashMap<String, String>) -> Option<String> {
     let blocks = cs.get("blocks")?.as_array()?;
-    let entity_map: HashMap<String, &Value> = cs
-        .get("entityMap")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v)).collect())
-        .unwrap_or_default();
+    let entity_map_val = cs.get("entityMap")?;
+
+    let mut entity_map: HashMap<String, &Value> = HashMap::new();
+    if let Some(obj) = entity_map_val.as_object() {
+        for (k, v) in obj {
+            let entity_obj = v.get("value").unwrap_or(v);
+            entity_map.insert(k.clone(), entity_obj);
+        }
+    }
 
     let mut lines: Vec<String> = Vec::new();
 
@@ -479,7 +515,7 @@ fn render_content_state(cs: &Value) -> Option<String> {
             "ordered-list-item" => format!("1. {text}"),
             "blockquote" => format!("> {text}"),
             "atomic" => {
-                if let Some(atomic_str) = render_atomic_block(block, &entity_map) {
+                if let Some(atomic_str) = render_atomic_block(block, &entity_map, media_map) {
                     atomic_str
                 } else {
                     continue;
@@ -500,7 +536,11 @@ fn render_content_state(cs: &Value) -> Option<String> {
     }
 }
 
-fn render_atomic_block(block: &Value, entity_map: &HashMap<String, &Value>) -> Option<String> {
+fn render_atomic_block(
+    block: &Value,
+    entity_map: &HashMap<String, &Value>,
+    media_map: &HashMap<String, String>,
+) -> Option<String> {
     let ranges = block.get("entityRanges")?.as_array()?;
     if ranges.is_empty() {
         return None;
@@ -511,13 +551,24 @@ fn render_atomic_block(block: &Value, entity_map: &HashMap<String, &Value>) -> O
     let entity_type = entity.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match entity_type {
-        "IMAGE" => {
-            let img_url = entity
-                .pointer("/data/media_url_https")
-                .or_else(|| entity.pointer("/data/url"))
-                .or_else(|| entity.pointer("/data/src"))
-                .or_else(|| entity.pointer("/data/image/url"))
+        "MEDIA" | "IMAGE" => {
+            let media_id = entity
+                .pointer("/data/mediaItems/0/mediaId")
+                .or_else(|| entity.pointer("/data/mediaId"))
                 .and_then(|v| v.as_str());
+
+            let img_url = media_id
+                .and_then(|id| media_map.get(id))
+                .map(String::as_str)
+                .or_else(|| {
+                    entity
+                        .pointer("/data/media_url_https")
+                        .or_else(|| entity.pointer("/data/url"))
+                        .or_else(|| entity.pointer("/data/src"))
+                        .or_else(|| entity.pointer("/data/image/url"))
+                        .and_then(|v| v.as_str())
+                });
+
             if let Some(url) = img_url {
                 Some(format!("![Image]({url})"))
             } else {
@@ -582,39 +633,37 @@ fn extract_author(target: &Value) -> (String, String) {
 fn extract_media_urls(target: &Value) -> Vec<String> {
     let mut urls = Vec::new();
 
-    // 1. Article cover media
-    if let Some(url) = target
-        .pointer("/article/cover_media/media_url_https")
-        .or_else(|| target.pointer("/article/article_results/result/cover_media/media_url_https"))
-        .and_then(|v| v.as_str())
+    let article_target = target
+        .pointer("/article/article_results/result")
+        .unwrap_or(target);
+
+    // 1. Article media_entities
+    if let Some(media_entities) = article_target
+        .get("media_entities")
+        .and_then(|v| v.as_array())
     {
-        urls.push(url.to_string());
-    }
+        for m in media_entities {
+            let img_url = m
+                .pointer("/media_info/original_img_url")
+                .or_else(|| m.get("media_url_https"))
+                .and_then(|v| v.as_str());
 
-    // 2. Draft.js content_state entityMap images
-    let content_state = target
-        .pointer("/article/article_results/result/content_state")
-        .or_else(|| target.pointer("/article/content_state"));
-
-    if let Some(cs) = content_state
-        && let Some(entity_map) = cs.get("entityMap").and_then(|v| v.as_object())
-    {
-        for (_key, entity) in entity_map {
-            if entity.get("type").and_then(|v| v.as_str()) == Some("IMAGE") {
-                let img_url = entity
-                    .pointer("/data/media_url_https")
-                    .or_else(|| entity.pointer("/data/url"))
-                    .or_else(|| entity.pointer("/data/src"))
-                    .or_else(|| entity.pointer("/data/image/url"))
-                    .and_then(|v| v.as_str());
-
-                if let Some(url) = img_url
-                    && !urls.contains(&url.to_string())
-                {
-                    urls.push(url.to_string());
-                }
+            if let Some(url) = img_url
+                && !urls.contains(&url.to_string())
+            {
+                urls.push(url.to_string());
             }
         }
+    }
+
+    // 2. Article cover media
+    if let Some(url) = article_target
+        .pointer("/cover_media/media_url_https")
+        .or_else(|| article_target.pointer("/cover_media/media_info/original_img_url"))
+        .and_then(|v| v.as_str())
+        && !urls.contains(&url.to_string())
+    {
+        urls.push(url.to_string());
     }
 
     // 3. Legacy / extended_entities media
@@ -739,6 +788,7 @@ fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat)
 
     Ok(())
 }
+
 fn sanitize_filename(name: &str) -> String {
     let clean: String = name
         .chars()
