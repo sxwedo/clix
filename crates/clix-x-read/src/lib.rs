@@ -91,19 +91,30 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let mut detail = fetch_tweet_detail(&client, &tweet_id).await?;
     spinner.finish_and_clear();
 
-    let output_path = args.output.unwrap_or_else(|| {
-        let ext = match args.format {
-            ReadOutputFormat::Markdown => "md",
-            ReadOutputFormat::Mdx => "mdx",
-            ReadOutputFormat::Json => "json",
-        };
-        let title_src = detail
-            .article_title
-            .as_deref()
-            .unwrap_or_else(|| detail.text.lines().next().unwrap_or(&detail.id));
-        let safe_title = sanitize_filename(title_src);
-        PathBuf::from(format!("{}_{}.{}", detail.author_handle, safe_title, ext))
-    });
+    let ext = match args.format {
+        ReadOutputFormat::Markdown => "md",
+        ReadOutputFormat::Mdx => "mdx",
+        ReadOutputFormat::Json => "json",
+    };
+    let title_src = detail
+        .article_title
+        .as_deref()
+        .unwrap_or_else(|| detail.text.lines().next().unwrap_or(&detail.id));
+    let safe_title = sanitize_filename(title_src);
+    let default_file_name = format!("{}_{}.{}", detail.author_handle, safe_title, ext);
+
+    let output_path = match args.output {
+        Some(out) => {
+            let out_str = out.to_string_lossy();
+            if out.is_dir() || out_str.ends_with('/') || out_str.ends_with('\\') {
+                fs::create_dir_all(&out).ok();
+                out.join(default_file_name)
+            } else {
+                out
+            }
+        }
+        None => PathBuf::from(default_file_name),
+    };
 
     if !args.no_media && !detail.media_urls.is_empty() {
         download_tweet_media(&client, &mut detail, &output_path).await?;
