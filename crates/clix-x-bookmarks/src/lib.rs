@@ -39,6 +39,10 @@ pub struct BookmarksArgs {
     /// Maximum number of bookmarks to fetch (default: all)
     #[arg(short = 'n', long)]
     pub count: Option<usize>,
+
+    /// Download attached media (images/photos) locally into a `media/` folder
+    #[arg(long)]
+    pub download_media: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +53,8 @@ pub struct TweetBookmark {
     pub text: String,
     pub created_at: String,
     pub url: String,
+    #[serde(default)]
+    pub media: Vec<String>,
 }
 
 pub async fn run(args: BookmarksArgs) -> Result<()> {
@@ -176,6 +182,10 @@ pub async fn run(args: BookmarksArgs) -> Result<()> {
         bail!(
             "No bookmarks found or failed to authenticate with X. Please verify your auth_token and ct0 values."
         );
+    }
+
+    if args.download_media {
+        download_all_media(&client, &bookmarks, &output_path).await?;
     }
 
     write_output(&bookmarks, &output_path, args.format)?;
@@ -318,12 +328,14 @@ fn extract_tweet(res: &Value) -> Option<TweetBookmark> {
     } else {
         raw_text.to_string()
     };
+
     let created_at = target
         .pointer("/legacy/created_at")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
+    let media = extract_media_urls(target);
     let url = format!("https://x.com/{author_handle}/status/{id}");
 
     Some(TweetBookmark {
@@ -333,22 +345,116 @@ fn extract_tweet(res: &Value) -> Option<TweetBookmark> {
         text,
         created_at,
         url,
+        media,
     })
 }
 
-fn write_output(bookmarks: &[TweetBookmark], path: &PathBuf, format: OutputFormat) -> Result<()> {
+fn extract_media_urls(target: &Value) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    // 1. Article cover media
+    if let Some(url) = target
+        .pointer("/article/cover_media/media_url_https")
+        .or_else(|| target.pointer("/article/article_results/result/cover_media/media_url_https"))
+        .and_then(|v| v.as_str())
+    {
+        urls.push(url.to_string());
+    }
+
+    // 2. Legacy / extended_entities media
+    let media_array = target
+        .pointer("/legacy/extended_entities/media")
+        .or_else(|| target.pointer("/legacy/entities/media"))
+        .and_then(|v| v.as_array());
+
+    if let Some(arr) = media_array {
+        for m in arr {
+            if let Some(url) = m.get("media_url_https").and_then(|v| v.as_str())
+                && !urls.contains(&url.to_string())
+            {
+                urls.push(url.to_string());
+            }
+        }
+    }
+
+    urls
+}
+
+async fn download_all_media(
+    client: &reqwest::Client,
+    bookmarks: &[TweetBookmark],
+    output_path: &std::path::Path,
+) -> Result<()> {
+    let base_dir = output_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let media_dir = base_dir.join("media");
+    fs::create_dir_all(&media_dir).context("failed to create media directory")?;
+
+    let spinner = ui::create_spinner("downloading attached media images...");
+
+    let mut downloaded = 0;
+    for b in bookmarks {
+        for (idx, media_url) in b.media.iter().enumerate() {
+            let ext = media_url
+                .split('.')
+                .next_back()
+                .unwrap_or("jpg")
+                .split('?')
+                .next()
+                .unwrap_or("jpg");
+            let file_name = format!("{}_{}_{}.{}", b.author_handle, b.id, idx + 1, ext);
+            let dest_path = media_dir.join(&file_name);
+
+            if dest_path.exists() {
+                downloaded += 1;
+                continue;
+            }
+
+            if let Ok(resp) = client.get(media_url).send().await
+                && let Ok(bytes) = resp.bytes().await
+            {
+                let _ = fs::write(dest_path, bytes);
+                downloaded += 1;
+            }
+        }
+    }
+
+    spinner.finish_and_clear();
+    ui::success(format!(
+        "downloaded {downloaded} media images to {}",
+        ui::style_bold(&media_dir.display().to_string())
+    ));
+    Ok(())
+}
+
+fn write_output(
+    bookmarks: &[TweetBookmark],
+    path: &std::path::Path,
+    format: OutputFormat,
+) -> Result<()> {
     match format {
         OutputFormat::Markdown => {
             let mut content = String::new();
             content.push_str("# X (Twitter) Bookmarks\n\n");
             content.push_str(&format!("Total: {} bookmarks\n\n", bookmarks.len()));
-            content.push_str("| Author | Tweet | Link |\n");
+            content.push_str("| Author | Tweet | Media / Links |\n");
             content.push_str("| --- | --- | --- |\n");
             for b in bookmarks {
                 let clean_text = b.text.replace('\n', " ").replace('|', "\\|");
+                let mut media_links = Vec::new();
+                for (idx, m) in b.media.iter().enumerate() {
+                    media_links.push(format!("[[![Img]({m})]({m})](Image {})", idx + 1));
+                }
+                let media_col = if media_links.is_empty() {
+                    format!("[View Status]({})", b.url)
+                } else {
+                    format!("[View Status]({})<br/>🖼️ {}", b.url, media_links.join(" "))
+                };
+
                 content.push_str(&format!(
-                    "| {} (@{}) | {} | [View]({}) |\n",
-                    b.author_name, b.author_handle, clean_text, b.url
+                    "| {} (@{}) | {} | {} |\n",
+                    b.author_name, b.author_handle, clean_text, media_col
                 ));
             }
             fs::write(path, content).context("failed to write Markdown output")?;
@@ -357,6 +463,9 @@ fn write_output(bookmarks: &[TweetBookmark], path: &PathBuf, format: OutputForma
             let mut content = String::new();
             for b in bookmarks {
                 content.push_str(&format!("{}\n", b.url));
+                for m in &b.media {
+                    content.push_str(&format!("  └─ {}\n", m));
+                }
             }
             fs::write(path, content).context("failed to write URLs output")?;
         }
