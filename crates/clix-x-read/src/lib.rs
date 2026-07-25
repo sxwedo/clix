@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
 };
@@ -96,7 +97,12 @@ pub async fn run(args: ReadArgs) -> Result<()> {
             ReadOutputFormat::Mdx => "mdx",
             ReadOutputFormat::Json => "json",
         };
-        PathBuf::from(format!("{}_{}.{}", detail.author_handle, detail.id, ext))
+        let title_src = detail
+            .article_title
+            .as_deref()
+            .unwrap_or_else(|| detail.text.lines().next().unwrap_or(&detail.id));
+        let safe_title = sanitize_filename(title_src);
+        PathBuf::from(format!("{}_{}.{}", detail.author_handle, safe_title, ext))
     });
 
     if !args.no_media && !detail.media_urls.is_empty() {
@@ -273,6 +279,7 @@ async fn fetch_tweet_detail(client: &reqwest::Client, tweet_id: &str) -> Result<
                 continue;
             }
         };
+
         let status = resp.status();
         if !status.is_success() {
             let body_text = resp.text().await.unwrap_or_default();
@@ -283,7 +290,7 @@ async fn fetch_tweet_detail(client: &reqwest::Client, tweet_id: &str) -> Result<
         let body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                last_err = e.to_string();
+                last_err.push_str(&format!("\n [{query_id} -> JSON parse error: {e}]"));
                 continue;
             }
         };
@@ -346,18 +353,14 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
     }
 
     let (author_name, author_handle) = extract_author(target);
+
     let article_title = target
         .pointer("/article/article_results/result/title")
         .or_else(|| target.pointer("/article/title"))
         .and_then(|v| v.as_str())
         .map(ToOwned::to_owned);
 
-    let raw_text = target
-        .pointer("/note_tweet/note_tweet_results/result/text")
-        .and_then(|v| v.as_str())
-        .or_else(|| target.pointer("/legacy/full_text").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
+    let full_text = extract_full_text(target);
 
     let created_at = target
         .pointer("/legacy/created_at")
@@ -366,7 +369,7 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
         .to_string();
 
     let media_urls = extract_media_urls(target);
-    let tweet_type = if article_title.is_some() {
+    let tweet_type = if article_title.is_some() || target.pointer("/article").is_some() {
         "Article".to_string()
     } else if target.pointer("/note_tweet").is_some() {
         "NoteTweet".to_string()
@@ -383,13 +386,135 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
         tweet_type,
         author_name,
         author_handle,
-        text: raw_text,
+        text: full_text,
         article_title,
         created_at,
         url,
         media_urls,
         local_media: Vec::new(),
     })
+}
+
+fn extract_full_text(target: &Value) -> String {
+    // 1. Try rendering from Article content_state (Draft.js AST)
+    if let Some(content_state) = target
+        .pointer("/article/article_results/result/content_state")
+        .or_else(|| target.pointer("/article/content_state"))
+        && let Some(rich_text) = render_content_state(content_state)
+        && !rich_text.trim().is_empty()
+    {
+        return rich_text;
+    }
+
+    // 2. Try Article plain_text / body text pointers
+    let article_plain = target
+        .pointer("/article/article_results/result/plain_text")
+        .or_else(|| target.pointer("/article/plain_text"))
+        .or_else(|| target.pointer("/article/article_results/result/body/text"))
+        .or_else(|| target.pointer("/article/body/text"))
+        .or_else(|| target.pointer("/article/article_results/result/content/text"))
+        .or_else(|| target.pointer("/article/content/text"))
+        .or_else(|| target.pointer("/article/preview_text"))
+        .and_then(|v| v.as_str());
+
+    if let Some(text) = article_plain
+        && !text.trim().is_empty()
+    {
+        return text.to_string();
+    }
+
+    // 3. Try NoteTweet text pointer
+    if let Some(note_text) = target
+        .pointer("/note_tweet/note_tweet_results/result/text")
+        .or_else(|| target.pointer("/note_tweet/text"))
+        .and_then(|v| v.as_str())
+        && !note_text.trim().is_empty()
+    {
+        return note_text.to_string();
+    }
+
+    // 4. Fallback to legacy full_text
+    target
+        .pointer("/legacy/full_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn render_content_state(cs: &Value) -> Option<String> {
+    let blocks = cs.get("blocks")?.as_array()?;
+    let entity_map: HashMap<String, &Value> = cs
+        .get("entityMap")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v)).collect())
+        .unwrap_or_default();
+
+    let mut lines: Vec<String> = Vec::new();
+
+    for block in blocks {
+        let block_type = block
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unstyled");
+        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+
+        let line = match block_type {
+            "header-one" => format!("# {text}"),
+            "header-two" => format!("## {text}"),
+            "header-three" => format!("### {text}"),
+            "header-four" => format!("#### {text}"),
+            "code-block" => format!("```\n{text}\n```"),
+            "unordered-list-item" => format!("- {text}"),
+            "ordered-list-item" => format!("1. {text}"),
+            "blockquote" => format!("> {text}"),
+            "atomic" => {
+                if let Some(atomic_str) = render_atomic_block(block, &entity_map) {
+                    atomic_str
+                } else {
+                    continue;
+                }
+            }
+            _ => text.to_string(),
+        };
+
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n\n"))
+    }
+}
+
+fn render_atomic_block(block: &Value, entity_map: &HashMap<String, &Value>) -> Option<String> {
+    let ranges = block.get("entityRanges")?.as_array()?;
+    if ranges.is_empty() {
+        return None;
+    }
+
+    let key = ranges.first()?.get("key")?.as_str()?.to_string();
+    let entity = entity_map.get(&key)?;
+    let entity_type = entity.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    match entity_type {
+        "MARKDOWN" => entity
+            .pointer("/data/markdown")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string),
+        "DIVIDER" => Some("---".to_string()),
+        "TWEET" => entity
+            .pointer("/data/tweetId")
+            .and_then(|v| v.as_str())
+            .map(|id| format!("[Embedded Tweet: https://x.com/i/status/{id}]")),
+        "LINK" => entity
+            .pointer("/data/url")
+            .and_then(|v| v.as_str())
+            .map(|url| format!("[{url}]({url})")),
+        _ => None,
+    }
 }
 
 fn extract_author(target: &Value) -> (String, String) {
@@ -530,20 +655,7 @@ fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat)
 
             if let Some(ref title) = detail.article_title {
                 content.push_str(&format!("# 📰 {title}\n\n"));
-            } else {
-                content.push_str(&format!(
-                    "# X Post by {} (@{})\n\n",
-                    detail.author_name, detail.author_handle
-                ));
             }
-
-            content.push_str(&format!(
-                "**Author:** {} ([@{}]({}))  \n",
-                detail.author_name, detail.author_handle, detail.url
-            ));
-            content.push_str(&format!("**Date:** {}  \n", detail.created_at));
-            content.push_str(&format!("**Type:** `{}`  \n\n", detail.tweet_type));
-            content.push_str("---\n\n");
 
             content.push_str(&detail.text);
             content.push_str("\n\n");
@@ -570,4 +682,26 @@ fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat)
     }
 
     Ok(())
+}
+fn sanitize_filename(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' || ('\u{4e00}'..='\u{9fa5}').contains(&c)
+            {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    let parts: Vec<&str> = clean.split('_').filter(|s| !s.is_empty()).collect();
+    let result = parts.join("_");
+    let truncated: String = result.chars().take(50).collect();
+    if truncated.is_empty() {
+        "post".to_string()
+    } else {
+        truncated
+    }
 }
