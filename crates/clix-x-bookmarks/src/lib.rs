@@ -302,13 +302,22 @@ fn extract_tweet(res: &Value) -> Option<TweetBookmark> {
         .unwrap_or(&author_handle)
         .to_string();
 
-    let text = target
+    let article_title = target
+        .pointer("/article/article_results/result/title")
+        .or_else(|| target.pointer("/article/title"))
+        .and_then(|v| v.as_str());
+
+    let raw_text = target
         .pointer("/note_tweet/note_tweet_results/result/text")
         .and_then(|v| v.as_str())
         .or_else(|| target.pointer("/legacy/full_text").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
+        .unwrap_or("");
 
+    let text = if let Some(title) = article_title {
+        format!("📰 [{title}] {raw_text}")
+    } else {
+        raw_text.to_string()
+    };
     let created_at = target
         .pointer("/legacy/created_at")
         .and_then(|v| v.as_str())
