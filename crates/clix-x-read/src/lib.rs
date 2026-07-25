@@ -509,24 +509,24 @@ fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat)
         ReadOutputFormat::Markdown | ReadOutputFormat::Mdx => {
             let mut content = String::new();
 
-            if format == ReadOutputFormat::Mdx {
-                content.push_str("---\n");
-                content.push_str(&format!(
-                    "title: \"{}\"\n",
-                    detail
-                        .article_title
-                        .as_deref()
-                        .unwrap_or(&detail.author_name)
-                ));
-                content.push_str(&format!(
-                    "author: \"{} (@{})\"\n",
-                    detail.author_name, detail.author_handle
-                ));
-                content.push_str(&format!("url: \"{}\"\n", detail.url));
-                content.push_str(&format!("date: \"{}\"\n", detail.created_at));
-                content.push_str(&format!("type: \"{}\"\n", detail.tweet_type));
-                content.push_str("---\n\n");
-            }
+            let display_title = detail.article_title.clone().unwrap_or_else(|| {
+                let first_line = detail.text.lines().next().unwrap_or(&detail.author_name);
+                first_line.chars().take(80).collect()
+            });
+
+            content.push_str("---\n");
+            content.push_str(&format!(
+                "title: {}\n",
+                serde_json::to_string(&display_title).unwrap_or_default()
+            ));
+            content.push_str(&format!(
+                "author: \"{} (@{})\"\n",
+                detail.author_name, detail.author_handle
+            ));
+            content.push_str(&format!("url: \"{}\"\n", detail.url));
+            content.push_str(&format!("date: \"{}\"\n", detail.created_at));
+            content.push_str(&format!("type: \"{}\"\n", detail.tweet_type));
+            content.push_str("---\n\n");
 
             if let Some(ref title) = detail.article_title {
                 content.push_str(&format!("# 📰 {title}\n\n"));
