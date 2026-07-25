@@ -170,6 +170,7 @@ dependencies = [
  "clix-core",
  "clix-gh-stars",
  "clix-x-bookmarks",
+ "clix-x-read",
  "tokio",
 ]
 
@@ -198,6 +199,20 @@ dependencies = [
 
 [[package]]
 name = "clix-x-bookmarks"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clix-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "urlencoding",
+]
+
+[[package]]
+name = "clix-x-read"
 version = "0.1.0"
 dependencies = [
  "anyhow",

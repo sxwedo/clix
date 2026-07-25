@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
 use clix_x_bookmarks::BookmarksArgs;
+use clix_x_read::ReadArgs;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,6 +42,8 @@ enum GhCommands {
 enum XCommands {
     /// Export all bookmarked tweets for an X account (Markdown, URLs, JSON)
     Bookmarks(BookmarksArgs),
+    /// Download and convert a single X status URL/ID into a local Markdown/MDX file
+    Read(ReadArgs),
 }
 
 #[tokio::main]
@@ -59,6 +62,7 @@ async fn run(cli: Cli) -> Result<()> {
         },
         Commands::X { command } => match command {
             XCommands::Bookmarks(args) => clix_x_bookmarks::run(args).await,
+            XCommands::Read(args) => clix_x_read::run(args).await,
         },
     }
 }

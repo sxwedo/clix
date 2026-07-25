@@ -1,4 +1,7 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fmt, fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
@@ -16,6 +19,31 @@ pub enum OutputFormat {
     Markdown,
     Urls,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TweetType {
+    Article,
+    NoteTweet,
+    Video,
+    Photo,
+    Quote,
+    Reply,
+    Tweet,
+}
+
+impl fmt::Display for TweetType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Article => write!(f, "Article"),
+            Self::NoteTweet => write!(f, "NoteTweet"),
+            Self::Video => write!(f, "Video"),
+            Self::Photo => write!(f, "Photo"),
+            Self::Quote => write!(f, "Quote"),
+            Self::Reply => write!(f, "Reply"),
+            Self::Tweet => write!(f, "Tweet"),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -48,6 +76,7 @@ pub struct BookmarksArgs {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TweetBookmark {
     pub id: String,
+    pub tweet_type: TweetType,
     pub author_name: String,
     pub author_handle: String,
     pub text: String,
@@ -55,6 +84,8 @@ pub struct TweetBookmark {
     pub url: String,
     #[serde(default)]
     pub media: Vec<String>,
+    #[serde(default)]
+    pub local_media: Vec<String>,
 }
 
 pub async fn run(args: BookmarksArgs) -> Result<()> {
@@ -185,7 +216,7 @@ pub async fn run(args: BookmarksArgs) -> Result<()> {
     }
 
     if args.download_media {
-        download_all_media(&client, &bookmarks, &output_path).await?;
+        download_all_media(&client, &mut bookmarks, &output_path).await?;
     }
 
     write_output(&bookmarks, &output_path, args.format)?;
@@ -336,17 +367,67 @@ fn extract_tweet(res: &Value) -> Option<TweetBookmark> {
         .to_string();
 
     let media = extract_media_urls(target);
+    let tweet_type = determine_tweet_type(target, article_title.is_some(), &media);
     let url = format!("https://x.com/{author_handle}/status/{id}");
 
     Some(TweetBookmark {
         id,
+        tweet_type,
         author_name,
         author_handle,
         text,
         created_at,
         url,
         media,
+        local_media: Vec::new(),
     })
+}
+
+fn determine_tweet_type(target: &Value, is_article: bool, media: &[String]) -> TweetType {
+    if is_article {
+        return TweetType::Article;
+    }
+
+    if target.pointer("/note_tweet").is_some() {
+        return TweetType::NoteTweet;
+    }
+
+    let media_array = target
+        .pointer("/legacy/extended_entities/media")
+        .or_else(|| target.pointer("/legacy/entities/media"))
+        .and_then(|v| v.as_array());
+
+    if let Some(arr) = media_array {
+        for m in arr {
+            if let Some(kind) = m.get("type").and_then(|v| v.as_str())
+                && (kind == "video" || kind == "animated_gif")
+            {
+                return TweetType::Video;
+            }
+        }
+        if !media.is_empty() {
+            return TweetType::Photo;
+        }
+    }
+
+    if target
+        .pointer("/legacy/is_quote_status")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || target.pointer("/quoted_status_result").is_some()
+    {
+        return TweetType::Quote;
+    }
+
+    if target
+        .pointer("/legacy/in_reply_to_status_id_str")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return TweetType::Reply;
+    }
+
+    TweetType::Tweet
 }
 
 fn extract_media_urls(target: &Value) -> Vec<String> {
@@ -382,19 +463,17 @@ fn extract_media_urls(target: &Value) -> Vec<String> {
 
 async fn download_all_media(
     client: &reqwest::Client,
-    bookmarks: &[TweetBookmark],
-    output_path: &std::path::Path,
+    bookmarks: &mut [TweetBookmark],
+    output_path: &Path,
 ) -> Result<()> {
-    let base_dir = output_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    let base_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
     let media_dir = base_dir.join("media");
     fs::create_dir_all(&media_dir).context("failed to create media directory")?;
 
     let spinner = ui::create_spinner("downloading attached media images...");
 
     let mut downloaded = 0;
-    for b in bookmarks {
+    for b in bookmarks.iter_mut() {
         for (idx, media_url) in b.media.iter().enumerate() {
             let ext = media_url
                 .split('.')
@@ -406,16 +485,19 @@ async fn download_all_media(
             let file_name = format!("{}_{}_{}.{}", b.author_handle, b.id, idx + 1, ext);
             let dest_path = media_dir.join(&file_name);
 
-            if dest_path.exists() {
-                downloaded += 1;
-                continue;
-            }
-
-            if let Ok(resp) = client.get(media_url).send().await
+            if !dest_path.exists()
+                && let Ok(resp) = client.get(media_url).send().await
                 && let Ok(bytes) = resp.bytes().await
             {
-                let _ = fs::write(dest_path, bytes);
+                let _ = fs::write(&dest_path, bytes);
+            }
+
+            if dest_path.exists() {
                 downloaded += 1;
+                let rel_path = format!("./media/{file_name}");
+                if !b.local_media.contains(&rel_path) {
+                    b.local_media.push(rel_path);
+                }
             }
         }
     }
@@ -428,24 +510,28 @@ async fn download_all_media(
     Ok(())
 }
 
-fn write_output(
-    bookmarks: &[TweetBookmark],
-    path: &std::path::Path,
-    format: OutputFormat,
-) -> Result<()> {
+fn write_output(bookmarks: &[TweetBookmark], path: &Path, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Markdown => {
             let mut content = String::new();
             content.push_str("# X (Twitter) Bookmarks\n\n");
             content.push_str(&format!("Total: {} bookmarks\n\n", bookmarks.len()));
-            content.push_str("| Author | Tweet | Media / Links |\n");
-            content.push_str("| --- | --- | --- |\n");
+            content.push_str("| Type | Author | Tweet | Media / Links |\n");
+            content.push_str("| --- | --- | --- | --- |\n");
             for b in bookmarks {
                 let clean_text = b.text.replace('\n', " ").replace('|', "\\|");
                 let mut media_links = Vec::new();
-                for (idx, m) in b.media.iter().enumerate() {
-                    media_links.push(format!("[[![Img]({m})]({m})](Image {})", idx + 1));
+
+                if !b.local_media.is_empty() {
+                    for m in &b.local_media {
+                        media_links.push(format!("[![Img]({m})]({m})"));
+                    }
+                } else {
+                    for m in &b.media {
+                        media_links.push(format!("[![Img]({m})]({m})"));
+                    }
                 }
+
                 let media_col = if media_links.is_empty() {
                     format!("[View Status]({})", b.url)
                 } else {
@@ -453,8 +539,8 @@ fn write_output(
                 };
 
                 content.push_str(&format!(
-                    "| {} (@{}) | {} | {} |\n",
-                    b.author_name, b.author_handle, clean_text, media_col
+                    "| `{}` | {} (@{}) | {} | {} |\n",
+                    b.tweet_type, b.author_name, b.author_handle, clean_text, media_col
                 ));
             }
             fs::write(path, content).context("failed to write Markdown output")?;
@@ -462,7 +548,7 @@ fn write_output(
         OutputFormat::Urls => {
             let mut content = String::new();
             for b in bookmarks {
-                content.push_str(&format!("{}\n", b.url));
+                content.push_str(&format!("[{}] {}\n", b.tweet_type, b.url));
                 for m in &b.media {
                     content.push_str(&format!("  └─ {}\n", m));
                 }

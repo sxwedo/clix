@@ -4,6 +4,7 @@ members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-x-bookmarks",
+    "crates/clix-x-read",
     ".",
 ]
 
@@ -22,4 +23,5 @@ clap = { version = "4.5", features = ["derive", "env"] }
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }
+clix-x-read = { path = "crates/clix-x-read" }
 tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
