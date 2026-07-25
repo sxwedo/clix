@@ -1,0 +1,26 @@
+[tools]
+rust = "1.96.1"
+
+[tasks.fmt]
+description = "Check Rust formatting"
+run = "cargo fmt -- --check"
+
+[tasks.check]
+description = "Type-check all crates in workspace"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "Run unit tests across workspace"
+run = "cargo test --workspace"
+
+[tasks.clippy]
+description = "Run clippy across workspace with warnings as errors"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.build]
+description = "Build all release binaries"
+run = "cargo build --release"
+
+[tasks.verify]
+description = "Run all local verification gates"
+depends = ["fmt", "check", "test", "clippy"]
