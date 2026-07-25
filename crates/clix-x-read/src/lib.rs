@@ -407,7 +407,6 @@ fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<Twee
 }
 
 fn extract_full_text(target: &Value, media_urls: &[String]) -> String {
-    // Build media_map: media_id -> original_img_url
     let mut media_map: HashMap<String, String> = HashMap::new();
     let article_target = target
         .pointer("/article/article_results/result")
@@ -418,14 +417,19 @@ fn extract_full_text(target: &Value, media_urls: &[String]) -> String {
         .and_then(|v| v.as_array())
     {
         for m in media_entities {
-            let media_id = m.get("media_id").and_then(|v| v.as_str());
+            let media_id = m.get("media_id").and_then(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            });
             let img_url = m
                 .pointer("/media_info/original_img_url")
                 .or_else(|| m.get("media_url_https"))
                 .and_then(|v| v.as_str());
 
             if let (Some(id), Some(url)) = (media_id, img_url) {
-                media_map.insert(id.to_string(), url.to_string());
+                media_map.insert(id, url.to_string());
             }
         }
     }
@@ -486,16 +490,30 @@ fn extract_full_text(target: &Value, media_urls: &[String]) -> String {
 
 fn render_content_state(cs: &Value, media_map: &HashMap<String, String>) -> Option<String> {
     let blocks = cs.get("blocks")?.as_array()?;
-    let entity_map_val = cs.get("entityMap")?;
+    let entity_map_val = cs.get("entityMap").or_else(|| cs.get("entity_map"));
 
     let mut entity_map: HashMap<String, &Value> = HashMap::new();
-    if let Some(obj) = entity_map_val.as_object() {
-        for (k, v) in obj {
-            let entity_obj = v.get("value").unwrap_or(v);
-            entity_map.insert(k.clone(), entity_obj);
+    if let Some(entity_map_val) = entity_map_val {
+        if let Some(arr) = entity_map_val.as_array() {
+            for item in arr {
+                let key = item.get("key").and_then(|v| {
+                    v.as_str()
+                        .map(ToString::to_string)
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                });
+
+                if let Some(key) = key {
+                    let entity_obj = item.get("value").unwrap_or(item);
+                    entity_map.insert(key, entity_obj);
+                }
+            }
+        } else if let Some(obj) = entity_map_val.as_object() {
+            for (k, v) in obj {
+                let entity_obj = v.get("value").unwrap_or(v);
+                entity_map.insert(k.clone(), entity_obj);
+            }
         }
     }
-
     let mut lines: Vec<String> = Vec::new();
 
     for block in blocks {
@@ -546,18 +564,30 @@ fn render_atomic_block(
         return None;
     }
 
-    let key = ranges.first()?.get("key")?.as_str()?.to_string();
+    let key_val = ranges.first()?.get("key")?;
+    let key = key_val
+        .as_str()
+        .map(ToString::to_string)
+        .or_else(|| key_val.as_u64().map(|n| n.to_string()))
+        .or_else(|| key_val.as_i64().map(|n| n.to_string()))?;
+
     let entity = entity_map.get(&key)?;
     let entity_type = entity.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
     match entity_type {
         "MEDIA" | "IMAGE" => {
-            let media_id = entity
+            let media_id_val = entity
                 .pointer("/data/mediaItems/0/mediaId")
-                .or_else(|| entity.pointer("/data/mediaId"))
-                .and_then(|v| v.as_str());
+                .or_else(|| entity.pointer("/data/mediaId"));
 
-            let img_url = media_id
+            let media_id_str = media_id_val.and_then(|v| {
+                v.as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            });
+
+            let img_url = media_id_str
+                .as_deref()
                 .and_then(|id| media_map.get(id))
                 .map(String::as_str)
                 .or_else(|| {
@@ -568,7 +598,6 @@ fn render_atomic_block(
                         .or_else(|| entity.pointer("/data/image/url"))
                         .and_then(|v| v.as_str())
                 });
-
             if let Some(url) = img_url {
                 Some(format!("![Image]({url})"))
             } else {
