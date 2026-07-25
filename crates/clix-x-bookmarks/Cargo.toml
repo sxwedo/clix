@@ -1,0 +1,16 @@
+[package]
+name = "clix-x-bookmarks"
+version = "0.1.0"
+edition = "2024"
+description = "Export bookmarked tweets for an X (Twitter) account."
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+clix-core = { path = "../clix-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+urlencoding = "2.1"

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
+use clix_x_bookmarks::BookmarksArgs;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -23,12 +24,23 @@ enum Commands {
         #[command(subcommand)]
         command: GhCommands,
     },
+    /// X (Twitter) tools & utilities
+    X {
+        #[command(subcommand)]
+        command: XCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum GhCommands {
     /// Export all starred repositories for a GitHub user (Markdown, URLs, JSON)
     Stars(StarsArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum XCommands {
+    /// Export all bookmarked tweets for an X account (Markdown, URLs, JSON)
+    Bookmarks(BookmarksArgs),
 }
 
 #[tokio::main]
@@ -44,6 +56,9 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Gh { command } => match command {
             GhCommands::Stars(args) => clix_gh_stars::run(args).await,
+        },
+        Commands::X { command } => match command {
+            XCommands::Bookmarks(args) => clix_x_bookmarks::run(args).await,
         },
     }
 }

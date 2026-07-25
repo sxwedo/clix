@@ -12,7 +12,7 @@
 
 `clix` is a fast, modular, multi-binary CLI toolset written in Rust designed to streamline daily developer tasks, GitHub workflows, social media integrations, and system utilities.
 
-Built as a **Cargo Workspace**, every tool in `clix` is organized under service namespaces (`clix gh`, `clix x`, `clix yt`, etc.) and can be used both as subcommands under the unified `clix` binary or installed as a standalone CLI tool (`clix-gh-stars`, etc.).
+Built as a **Cargo Workspace**, every tool in `clix` is organized under service namespaces (`clix gh`, `clix x`, `clix yt`, etc.) and can be used both as subcommands under the unified `clix` binary or installed as a standalone CLI tool (`clix-gh-stars`, `clix-x-bookmarks`, etc.).
 
 ---
 
@@ -21,9 +21,10 @@ Built as a **Cargo Workspace**, every tool in `clix` is organized under service 
 ```text
 clix/
 ├── crates/
-│   ├── clix-core/      # Shared UI styles, spinners, GitHub auth & config resolvers
-│   └── clix-gh-stars/  # Standalone binary: `clix-gh-stars`
-└── src/                # Unified entrypoint binary: `clix`
+│   ├── clix-core/         # Shared UI styles, spinners, GitHub auth & config resolvers
+│   ├── clix-gh-stars/     # Standalone binary: `clix-gh-stars`
+│   └── clix-x-bookmarks/  # Standalone binary: `clix-x-bookmarks`
+└── src/                   # Unified entrypoint binary: `clix`
 ```
 
 ---
@@ -41,17 +42,32 @@ Batch export all starred repositories of any GitHub user into Markdown tables, p
 
 ##### Usage:
 ```sh
-# Method 1: Via unified CLI (default output: <username>_starred_repos.md)
+# Method 1: Via unified CLI
 clix gh stars
 
-# Method 2: Via standalone binary for a specific user (default output: octocat_starred_repos.md)
-clix-gh-stars octocat
-
-# Export a specific user's stars as plain URLs
+# Method 2: Via standalone binary for a specific user
 clix-gh-stars octocat -f urls -o urls.txt
+```
 
-# Export as JSON
-clix gh stars -f json -o stars.json
+---
+
+### 🐦 X (Twitter) Utilities (`clix x`)
+
+#### 🔖 `clix x bookmarks` / `clix-x-bookmarks` — X Bookmarked Tweets Exporter
+Export your bookmarked tweets from X (Twitter) via GraphQL into Markdown, plain URL lists, or JSON files using `auth_token` and `ct0` cookies.
+
+- 🔑 **Simple Auth:** Pass `--auth-token` and `--ct0` or set `X_AUTH_TOKEN` and `X_CT0` env vars.
+- 📑 **Multiple Formats:** Supports Markdown tables, plain URLs, and JSON export.
+
+##### Usage:
+```sh
+# Export X bookmarks using env vars
+export X_AUTH_TOKEN="your_auth_token"
+export X_CT0="your_ct0"
+clix x bookmarks
+
+# Export using CLI flags & limit to 50 items
+clix-x-bookmarks --auth-token "..." --ct0 "..." -n 50 -f markdown -o my_x_bookmarks.md
 ```
 
 ---
@@ -64,15 +80,10 @@ git clone https://github.com/sxwedo/clix.git && cd clix
 cargo build --release
 
 # Binaries generated:
-# - target/release/clix            (Unified CLI)
-# - target/release/clix-gh-stars   (Standalone GitHub Stars CLI)
+# - target/release/clix               (Unified CLI)
+# - target/release/clix-gh-stars      (Standalone GitHub Stars CLI)
+# - target/release/clix-x-bookmarks   (Standalone X Bookmarks CLI)
 ```
-
----
-
-## 🗺️ Roadmap
-
-- [x] `clix gh stars` — Fast GitHub starred repos batch exporter.
 
 ---
 
