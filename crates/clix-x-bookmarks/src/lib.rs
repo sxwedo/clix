@@ -194,6 +194,7 @@ fn resolve_auth_token(cli_val: Option<String>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| env::var("X_AUTH_TOKEN").ok())
         .or_else(|| env::var("TWITTER_AUTH_TOKEN").ok())
+        .or_else(|| env::var("AUTH_TOKEN").ok())
         .map(|s| s.trim().to_string())
 }
 
@@ -202,6 +203,7 @@ fn resolve_ct0(cli_val: Option<String>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| env::var("X_CT0").ok())
         .or_else(|| env::var("TWITTER_CT0").ok())
+        .or_else(|| env::var("CT0").ok())
         .map(|s| s.trim().to_string())
 }
 
