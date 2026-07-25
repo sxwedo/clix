@@ -500,6 +500,19 @@ fn render_atomic_block(block: &Value, entity_map: &HashMap<String, &Value>) -> O
     let entity_type = entity.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match entity_type {
+        "IMAGE" => {
+            let img_url = entity
+                .pointer("/data/media_url_https")
+                .or_else(|| entity.pointer("/data/url"))
+                .or_else(|| entity.pointer("/data/src"))
+                .or_else(|| entity.pointer("/data/image/url"))
+                .and_then(|v| v.as_str());
+            if let Some(url) = img_url {
+                Some(format!("![Image]({url})"))
+            } else {
+                Some("[Image]".to_string())
+            }
+        }
         "MARKDOWN" => entity
             .pointer("/data/markdown")
             .and_then(|v| v.as_str())
@@ -558,6 +571,7 @@ fn extract_author(target: &Value) -> (String, String) {
 fn extract_media_urls(target: &Value) -> Vec<String> {
     let mut urls = Vec::new();
 
+    // 1. Article cover media
     if let Some(url) = target
         .pointer("/article/cover_media/media_url_https")
         .or_else(|| target.pointer("/article/article_results/result/cover_media/media_url_https"))
@@ -566,6 +580,33 @@ fn extract_media_urls(target: &Value) -> Vec<String> {
         urls.push(url.to_string());
     }
 
+    // 2. Draft.js content_state entityMap images
+    let content_state = target
+        .pointer("/article/article_results/result/content_state")
+        .or_else(|| target.pointer("/article/content_state"));
+
+    if let Some(cs) = content_state
+        && let Some(entity_map) = cs.get("entityMap").and_then(|v| v.as_object())
+    {
+        for (_key, entity) in entity_map {
+            if entity.get("type").and_then(|v| v.as_str()) == Some("IMAGE") {
+                let img_url = entity
+                    .pointer("/data/media_url_https")
+                    .or_else(|| entity.pointer("/data/url"))
+                    .or_else(|| entity.pointer("/data/src"))
+                    .or_else(|| entity.pointer("/data/image/url"))
+                    .and_then(|v| v.as_str());
+
+                if let Some(url) = img_url
+                    && !urls.contains(&url.to_string())
+                {
+                    urls.push(url.to_string());
+                }
+            }
+        }
+    }
+
+    // 3. Legacy / extended_entities media
     let media_array = target
         .pointer("/legacy/extended_entities/media")
         .or_else(|| target.pointer("/legacy/entities/media"))
@@ -617,7 +658,9 @@ async fn download_tweet_media(
         if dest_path.exists() {
             downloaded += 1;
             let rel_path = format!("./media/{file_name}");
-            detail.local_media.push(rel_path);
+            detail.local_media.push(rel_path.clone());
+            // Replace remote image url with local relative path in detail.text!
+            detail.text = detail.text.replace(media_url, &rel_path);
         }
     }
 
@@ -660,15 +703,17 @@ fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat)
             content.push_str(&detail.text);
             content.push_str("\n\n");
 
-            if !detail.local_media.is_empty() {
-                content.push_str("### 🖼️ Attached Media\n\n");
-                for (idx, img_path) in detail.local_media.iter().enumerate() {
-                    content.push_str(&format!("![Image {}]({img_path})\n\n", idx + 1));
-                }
-            } else if !detail.media_urls.is_empty() {
-                content.push_str("### 🖼️ Attached Media\n\n");
-                for (idx, img_url) in detail.media_urls.iter().enumerate() {
-                    content.push_str(&format!("![Image {}]({img_url})\n\n", idx + 1));
+            if !detail.text.contains("![Image") {
+                if !detail.local_media.is_empty() {
+                    content.push_str("### 🖼️ Attached Media\n\n");
+                    for (idx, img_path) in detail.local_media.iter().enumerate() {
+                        content.push_str(&format!("![Image {}]({img_path})\n\n", idx + 1));
+                    }
+                } else if !detail.media_urls.is_empty() {
+                    content.push_str("### 🖼️ Attached Media\n\n");
+                    for (idx, img_url) in detail.media_urls.iter().enumerate() {
+                        content.push_str(&format!("![Image {}]({img_url})\n\n", idx + 1));
+                    }
                 }
             }
 
