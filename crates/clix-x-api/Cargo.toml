@@ -1,19 +1,14 @@
 [package]
-name = "clix-gh-stars"
+name = "clix-x-api"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Export all starred GitHub repositories for a user."
+description = "Shared X authentication, HTTP, and content types for clix."
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
-clix-core = { path = "../clix-core" }
 reqwest = { workspace = true, features = ["json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
-
-[dev-dependencies]
-tempfile.workspace = true
+tokio = { workspace = true, features = ["time"] }

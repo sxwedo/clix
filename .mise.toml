@@ -3,24 +3,34 @@ rust = "1.96.1"
 
 [tasks.fmt]
 description = "Check Rust formatting"
-run = "cargo fmt -- --check"
+run = "cargo fmt --all -- --check"
 
 [tasks.check]
 description = "Type-check all crates in workspace"
-run = "cargo check --workspace"
+run = "cargo check --workspace --locked"
 
 [tasks.test]
 description = "Run unit tests across workspace"
-run = "cargo test --workspace"
+run = "cargo test --workspace --locked"
 
 [tasks.clippy]
-description = "Run clippy across workspace with warnings as errors"
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+description = "Run strict Clippy across all workspace targets"
+run = "cargo clippy --workspace --all-targets --locked -- -D warnings -D clippy::pedantic -D clippy::nursery"
+
+[tasks.docs]
+description = "Build workspace documentation with warnings denied"
+run = "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked"
 
 [tasks.build]
 description = "Build all release binaries"
-run = "cargo build --release"
+run = "cargo build --workspace --release --locked"
 
 [tasks.verify]
 description = "Run all local verification gates"
-depends = ["fmt", "check", "test", "clippy"]
+run = """
+cargo fmt --all -- --check
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings -D clippy::pedantic -D clippy::nursery
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
+"""

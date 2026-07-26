@@ -3,25 +3,49 @@ resolver = "2"
 members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
+    "crates/clix-view",
+    "crates/clix-x-api",
     "crates/clix-x-bookmarks",
     "crates/clix-x-read",
     ".",
 ]
 
-[package]
-name = "clix"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "CLI Extensions for daily developer superpowers."
+rust-version = "1.96.1"
 license = "MIT"
+
+[workspace.dependencies]
+anstyle = "1.0"
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+indicatif = "0.17"
+reqwest = { version = "0.12", default-features = false }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.27"
+tokio = "1.40"
+viuer = "0.7"
+
+[package]
+name = "clix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "CLI Extensions for daily developer superpowers."
+license.workspace = true
 readme = "README.md"
 keywords = ["cli", "developer-tools", "github", "twitter", "utility"]
 
 [dependencies]
-anyhow = "1.0"
-clap = { version = "4.5", features = ["derive", "env"] }
+anyhow.workspace = true
+clap.workspace = true
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
+clix-view = { path = "crates/clix-view" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }
 clix-x-read = { path = "crates/clix-x-read" }
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt"] }

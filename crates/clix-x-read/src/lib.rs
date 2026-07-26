@@ -1,24 +1,21 @@
 use std::{
-    collections::HashMap,
-    env, fs,
+    borrow::Cow,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use clix_core::ui;
-use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use clix_core::{
+    fs::{atomic_write, parent_or_current},
+    ui,
+};
+use clix_x_api::{XCredentials, build_media_client, markdown_destination, media_extension};
 
-const TWITTER_BEARER_TOKEN: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+pub use clix_x_api::{TweetDetail, fetch_tweet_detail};
 
-const TWEET_DETAIL_QUERY_IDS: &[&str] = &[
-    "Lq1caG5YPcdhpTdS2ZRx7Q",
-    "_NvJCnIjOW__EP5-RF197A",
-    "97JF30KziU00483E_8elBA",
-    "aFvUsJm2c-oDkJV75blV6g",
-];
+const MAX_CONCURRENT_MEDIA_REQUESTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReadOutputFormat {
@@ -29,18 +26,18 @@ pub enum ReadOutputFormat {
 
 #[derive(Debug, Args)]
 pub struct ReadArgs {
-    /// X (Twitter) status URL or Tweet ID (e.g., https://x.com/user/status/123456789)
+    /// X status URL or post ID (for example, <https://x.com/user/status/123456789>)
     pub url_or_id: String,
 
-    /// Twitter auth_token cookie (or set X_AUTH_TOKEN / TWITTER_AUTH_TOKEN env)
+    /// X `auth_token` cookie (or set `X_AUTH_TOKEN` / `TWITTER_AUTH_TOKEN`)
     #[arg(long)]
     pub auth_token: Option<String>,
 
-    /// Twitter ct0 (CSRF) cookie (or set X_CT0 / TWITTER_CT0 env)
+    /// X `ct0` (CSRF) cookie (or set `X_CT0` / `TWITTER_CT0`)
     #[arg(long)]
     pub ct0: Option<String>,
 
-    /// Output file path (default: <author_handle>_<title>.md)
+    /// Output path (default: `<author_handle>_<title>.md`)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
@@ -53,78 +50,80 @@ pub struct ReadArgs {
     pub no_media: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TweetDetail {
-    pub id: String,
-    pub tweet_type: String,
-    pub author_name: String,
-    pub author_handle: String,
-    pub text: String,
-    pub article_title: Option<String>,
-    pub created_at: String,
-    pub url: String,
-    pub media_urls: Vec<String>,
-    pub local_media: Vec<String>,
+struct MediaJob {
+    media_index: usize,
+    url: String,
+    destination: PathBuf,
+    relative_path: String,
 }
 
+/// Download one X post and render it in the requested local format.
+///
+/// # Errors
+///
+/// Returns an error for an invalid post identifier, missing credentials,
+/// failed X requests, media-directory failures, or output serialization and
+/// write failures.
 pub async fn run(args: ReadArgs) -> Result<()> {
     let tweet_id = extract_tweet_id(&args.url_or_id)?;
 
-    let auth_token = resolve_auth_token(args.auth_token);
-    let ct0 = resolve_ct0(args.ct0);
-
-    let (auth_token, ct0) = match (auth_token, ct0) {
-        (Some(a), Some(c)) => (a, c),
-        _ => bail!(
+    let Some(credentials) = XCredentials::resolve(args.auth_token, args.ct0) else {
+        bail!(
             "Missing X authentication credentials!\n\n\
              Please provide both credentials via CLI flags or env vars:\n  \
              clix x read <URL> --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n\n\
              Or set environment variables:\n  \
              export X_AUTH_TOKEN=\"...\"\n  \
              export X_CT0=\"...\""
-        ),
+        );
     };
 
-    let client = build_http_client(&auth_token, &ct0)?;
+    let client = credentials.build_client()?;
     let spinner = ui::create_spinner(&format!("fetching X status {tweet_id}..."));
 
     let mut detail = fetch_tweet_detail(&client, &tweet_id).await?;
     spinner.finish_and_clear();
 
-    let ext = match args.format {
+    let extension = match args.format {
         ReadOutputFormat::Markdown => "md",
         ReadOutputFormat::Mdx => "mdx",
         ReadOutputFormat::Json => "json",
     };
-    let title_src = detail
-        .article_title
-        .as_deref()
-        .unwrap_or_else(|| detail.text.lines().next().unwrap_or(&detail.id));
-    let safe_title = sanitize_filename(title_src);
-    let default_file_name = format!("{}_{}.{}", detail.author_handle, safe_title, ext);
-
-    let output_path = match args.output {
-        Some(out) => {
-            let out_str = out.to_string_lossy();
-            if out.is_dir() || out_str.ends_with('/') || out_str.ends_with('\\') {
-                fs::create_dir_all(&out).ok();
-                out.join(default_file_name)
-            } else {
-                out
-            }
-        }
-        None => PathBuf::from(default_file_name),
-    };
+    let title = detail.article_title.clone().unwrap_or_else(|| {
+        markdown_text_to_plain(detail.text.lines().next().unwrap_or(&detail.id))
+    });
+    let default_file_name = format!(
+        "{}_{}.{}",
+        detail.author_handle,
+        sanitize_filename(&title),
+        extension
+    );
+    let output_path = resolve_output_path(args.output, default_file_name)?;
 
     if !args.no_media && !detail.media_urls.is_empty() {
-        download_tweet_media(&client, &mut detail, &output_path).await?;
+        let media_client = build_media_client()?;
+        download_tweet_media(&media_client, &mut detail, &output_path).await?;
     }
 
     write_tweet_file(&detail, &output_path, args.format)?;
 
+    let classification = if detail.subtypes.is_empty() {
+        detail.content_type.to_string()
+    } else {
+        format!(
+            "{} [{}]",
+            detail.content_type,
+            detail
+                .subtypes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     ui::success(format!(
         "saved X {} by @{} to {}",
-        ui::style_bold(&detail.tweet_type),
+        ui::style_bold(&classification),
         ui::style_bold(&detail.author_handle),
         ui::style_bold(&output_path.display().to_string())
     ));
@@ -132,22 +131,44 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolve_output_path(output: Option<PathBuf>, default_file_name: String) -> Result<PathBuf> {
+    let Some(output) = output else {
+        return Ok(PathBuf::from(default_file_name));
+    };
+
+    let output_text = output.to_string_lossy();
+    if output.is_dir() || output_text.ends_with('/') || output_text.ends_with('\\') {
+        fs::create_dir_all(&output)
+            .with_context(|| format!("failed to create output directory {}", output.display()))?;
+        Ok(output.join(default_file_name))
+    } else {
+        Ok(output)
+    }
+}
+
 fn extract_tweet_id(input: &str) -> Result<String> {
     let input = input.trim();
-    if input.chars().all(|c| c.is_ascii_digit()) {
+    if input.is_empty() {
+        bail!("X status URL or Tweet ID cannot be empty");
+    }
+    if input.bytes().all(|byte| byte.is_ascii_digit()) {
         return Ok(input.to_string());
     }
 
     if let Ok(url) = reqwest::Url::parse(input)
-        && let Some(segments) = url.path_segments()
+        && matches!(
+            url.host_str(),
+            Some("x.com" | "www.x.com" | "twitter.com" | "www.twitter.com")
+        )
+        && let Some(mut segments) = url.path_segments()
     {
-        let parts: Vec<&str> = segments.collect();
-        if let Some(pos) = parts.iter().position(|&p| p == "status")
-            && let Some(id) = parts.get(pos + 1)
-        {
-            let clean_id = id.split('?').next().unwrap_or(id);
-            if clean_id.chars().all(|c| c.is_ascii_digit()) {
-                return Ok(clean_id.to_string());
+        while let Some(segment) = segments.next() {
+            if segment == "status"
+                && let Some(id) = segments.next()
+                && !id.is_empty()
+                && id.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Ok(id.to_string());
             }
         }
     }
@@ -155,688 +176,666 @@ fn extract_tweet_id(input: &str) -> Result<String> {
     bail!("invalid X status URL or Tweet ID: `{input}`")
 }
 
-fn resolve_auth_token(cli_val: Option<String>) -> Option<String> {
-    cli_val
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env::var("X_AUTH_TOKEN").ok())
-        .or_else(|| env::var("TWITTER_AUTH_TOKEN").ok())
-        .or_else(|| env::var("AUTH_TOKEN").ok())
-        .map(|s| s.trim().to_string())
-}
-
-fn resolve_ct0(cli_val: Option<String>) -> Option<String> {
-    cli_val
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env::var("X_CT0").ok())
-        .or_else(|| env::var("TWITTER_CT0").ok())
-        .or_else(|| env::var("CT0").ok())
-        .map(|s| s.trim().to_string())
-}
-
-fn build_http_client(auth_token: &str, ct0: &str) -> Result<reqwest::Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(TWITTER_BEARER_TOKEN).context("invalid bearer token")?,
-    );
-    headers.insert(
-        "cookie",
-        HeaderValue::from_str(&format!("auth_token={auth_token}; ct0={ct0}"))
-            .context("invalid cookie header")?,
-    );
-    headers.insert(
-        "x-csrf-token",
-        HeaderValue::from_str(ct0).context("invalid csrf token header")?,
-    );
-    headers.insert("x-twitter-active-user", HeaderValue::from_static("yes"));
-    headers.insert("x-twitter-client-language", HeaderValue::from_static("en"));
-    headers.insert(
-        "user-agent",
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
-    );
-
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .context("failed to build HTTP client for X")
-}
-
-async fn fetch_tweet_detail(client: &reqwest::Client, tweet_id: &str) -> Result<TweetDetail> {
-    let variables_json = serde_json::json!({
-        "focalTweetId": tweet_id,
-        "with_rux_injections": false,
-        "rankingMode": "Relevance",
-        "includePromotedContent": true,
-        "withCommunity": true,
-        "withQuickPromoteEligibilityTweetFields": true,
-        "withBirdwatchNotes": true,
-        "withVoice": true
-    })
-    .to_string();
-
-    let features_json = serde_json::json!({
-        "rweb_video_screen_enabled": true,
-        "profile_label_improvements_pcf_label_in_post_enabled": true,
-        "responsive_web_profile_redirect_enabled": true,
-        "rweb_tipjar_consumption_enabled": true,
-        "verified_phone_label_enabled": false,
-        "creator_subscriptions_tweet_preview_api_enabled": true,
-        "responsive_web_graphql_timeline_navigation_enabled": true,
-        "responsive_web_graphql_exclude_directive_enabled": true,
-        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-        "premium_content_api_read_enabled": false,
-        "communities_web_enable_tweet_community_results_fetch": true,
-        "c9s_tweet_anatomy_moderator_badge_enabled": true,
-        "responsive_web_grok_analyze_button_fetch_trends_enabled": false,
-        "responsive_web_grok_analyze_post_followups_enabled": false,
-        "responsive_web_grok_annotations_enabled": false,
-        "responsive_web_jetfuel_frame": true,
-        "post_ctas_fetch_enabled": true,
-        "responsive_web_grok_share_attachment_enabled": true,
-        "articles_preview_enabled": true,
-        "responsive_web_edit_tweet_api_enabled": true,
-        "graphql_is_translatable_rweb_tweet_is_translatable_enabled": true,
-        "view_counts_everywhere_api_enabled": true,
-        "longform_notetweets_consumption_enabled": true,
-        "responsive_web_twitter_article_tweet_consumption_enabled": true,
-        "tweet_awards_web_tipping_enabled": false,
-        "responsive_web_grok_show_grok_translated_post": false,
-        "responsive_web_grok_analysis_button_from_backend": true,
-        "creator_subscriptions_quote_tweet_preview_enabled": false,
-        "freedom_of_speech_not_reach_fetch_enabled": true,
-        "standardized_nudges_misinfo": true,
-        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": true,
-        "longform_notetweets_rich_text_read_enabled": true,
-        "longform_notetweets_inline_media_enabled": true,
-        "responsive_web_grok_image_annotation_enabled": true,
-        "responsive_web_grok_imagine_annotation_enabled": true,
-        "responsive_web_grok_community_note_auto_translation_is_enabled": false,
-        "responsive_web_enhance_cards_enabled": false,
-        "responsive_web_twitter_article_plain_text_enabled": true,
-        "responsive_web_twitter_article_seed_tweet_detail_enabled": true,
-        "responsive_web_twitter_article_seed_tweet_summary_enabled": true
-    })
-    .to_string();
-
-    let field_toggles_json = serde_json::json!({
-        "withPayments": false,
-        "withAuxiliaryUserLabels": false,
-        "withArticleRichContentState": true,
-        "withArticlePlainText": true,
-        "withGrokAnalyze": false,
-        "withDisallowedReplyControls": false
-    })
-    .to_string();
-
-    let mut last_err = String::from("unknown error");
-
-    for query_id in TWEET_DETAIL_QUERY_IDS {
-        let url = format!("https://x.com/i/api/graphql/{query_id}/TweetDetail");
-        let resp = match client
-            .get(&url)
-            .query(&[
-                ("variables", &variables_json),
-                ("features", &features_json),
-                ("fieldToggles", &field_toggles_json),
-            ])
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                last_err.push_str(&format!("\n [{query_id} -> send error: {e}]"));
-                continue;
-            }
-        };
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body_text = resp.text().await.unwrap_or_default();
-            last_err.push_str(&format!("\n [{query_id} -> HTTP {status}: {body_text}]"));
-            continue;
-        }
-
-        let body: Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                last_err.push_str(&format!("\n [{query_id} -> JSON parse error: {e}]"));
-                continue;
-            }
-        };
-
-        if let Some(detail) = parse_tweet_detail_response(&body, tweet_id) {
-            return Ok(detail);
-        }
-    }
-
-    bail!("Failed to fetch X status {tweet_id}: {last_err}")
-}
-
-fn parse_tweet_detail_response(val: &Value, tweet_id: &str) -> Option<TweetDetail> {
-    // 1. Try direct tweetResult pointer
-    if let Some(res) = val.pointer("/data/tweetResult/result")
-        && let Some(detail) = extract_tweet_detail_from_result(res, tweet_id)
-    {
-        return Some(detail);
-    }
-
-    // 2. Try threaded_conversation instructions
-    let instructions = val
-        .pointer("/data/threaded_conversation_with_injections_v2/instructions")
-        .or_else(|| val.pointer("/data/threaded_conversation_with_injections/instructions"))
-        .and_then(|v| v.as_array());
-
-    if let Some(instructions) = instructions {
-        for inst in instructions {
-            let entries = inst.get("entries").and_then(|v| v.as_array());
-            if let Some(entries) = entries {
-                for entry in entries {
-                    let item_result = entry
-                        .pointer("/content/itemContent/tweet_results/result")
-                        .or_else(|| entry.pointer("/item/itemContent/tweet_results/result"));
-
-                    if let Some(res) = item_result
-                        && let Some(detail) = extract_tweet_detail_from_result(res, tweet_id)
-                    {
-                        return Some(detail);
-                    }
-                }
-            }
-        }
-    }
-
-    None
-}
-
-fn extract_tweet_detail_from_result(res: &Value, target_id: &str) -> Option<TweetDetail> {
-    let target =
-        if res.get("__typename").and_then(|v| v.as_str()) == Some("TweetWithVisibilityResults") {
-            res.get("tweet")?
-        } else {
-            res
-        };
-
-    let res_id = target.get("rest_id")?.as_str()?;
-    if res_id != target_id {
-        return None;
-    }
-
-    let (author_name, author_handle) = extract_author(target);
-
-    let article_title = target
-        .pointer("/article/article_results/result/title")
-        .or_else(|| target.pointer("/article/title"))
-        .and_then(|v| v.as_str())
-        .map(ToOwned::to_owned);
-
-    let media_urls = extract_media_urls(target);
-    let full_text = extract_full_text(target, &media_urls);
-
-    let created_at = target
-        .pointer("/legacy/created_at")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let tweet_type = if article_title.is_some() || target.pointer("/article").is_some() {
-        "Article".to_string()
-    } else if target.pointer("/note_tweet").is_some() {
-        "NoteTweet".to_string()
-    } else if !media_urls.is_empty() {
-        "Media".to_string()
-    } else {
-        "Tweet".to_string()
-    };
-
-    let url = format!("https://x.com/{author_handle}/status/{target_id}");
-
-    Some(TweetDetail {
-        id: target_id.to_string(),
-        tweet_type,
-        author_name,
-        author_handle,
-        text: full_text,
-        article_title,
-        created_at,
-        url,
-        media_urls,
-        local_media: Vec::new(),
-    })
-}
-
-fn extract_full_text(target: &Value, media_urls: &[String]) -> String {
-    let mut media_map: HashMap<String, String> = HashMap::new();
-    let article_target = target
-        .pointer("/article/article_results/result")
-        .unwrap_or(target);
-
-    if let Some(media_entities) = article_target
-        .get("media_entities")
-        .and_then(|v| v.as_array())
-    {
-        for m in media_entities {
-            let media_id = m.get("media_id").and_then(|v| {
-                v.as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| v.as_u64().map(|n| n.to_string()))
-                    .or_else(|| v.as_i64().map(|n| n.to_string()))
-            });
-            let img_url = m
-                .pointer("/media_info/original_img_url")
-                .or_else(|| m.get("media_url_https"))
-                .and_then(|v| v.as_str());
-
-            if let (Some(id), Some(url)) = (media_id, img_url) {
-                media_map.insert(id, url.to_string());
-            }
-        }
-    }
-
-    // 1. Try rendering from Article content_state (Draft.js AST)
-    if let Some(content_state) = target
-        .pointer("/article/article_results/result/content_state")
-        .or_else(|| target.pointer("/article/content_state"))
-        && let Some(rich_text) = render_content_state(content_state, &media_map)
-        && !rich_text.trim().is_empty()
-    {
-        return rich_text;
-    }
-
-    // 2. Try Article plain_text / body text pointers
-    let article_plain = target
-        .pointer("/article/article_results/result/plain_text")
-        .or_else(|| target.pointer("/article/plain_text"))
-        .or_else(|| target.pointer("/article/article_results/result/body/text"))
-        .or_else(|| target.pointer("/article/body/text"))
-        .or_else(|| target.pointer("/article/article_results/result/content/text"))
-        .or_else(|| target.pointer("/article/content/text"))
-        .or_else(|| target.pointer("/article/preview_text"))
-        .and_then(|v| v.as_str());
-
-    if let Some(text) = article_plain
-        && !text.trim().is_empty()
-    {
-        return text.to_string();
-    }
-
-    // 3. Try NoteTweet text pointer
-    if let Some(note_text) = target
-        .pointer("/note_tweet/note_tweet_results/result/text")
-        .or_else(|| target.pointer("/note_tweet/text"))
-        .and_then(|v| v.as_str())
-        && !note_text.trim().is_empty()
-    {
-        return note_text.to_string();
-    }
-
-    // 4. Fallback to legacy full_text
-    let mut legacy_text = target
-        .pointer("/legacy/full_text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-
-    // If media exists but is not in text, append image tags
-    if !media_urls.is_empty() && !legacy_text.contains("![Image") {
-        for url in media_urls {
-            legacy_text.push_str(&format!("\n\n![Image]({url})"));
-        }
-    }
-
-    legacy_text
-}
-
-fn render_content_state(cs: &Value, media_map: &HashMap<String, String>) -> Option<String> {
-    let blocks = cs.get("blocks")?.as_array()?;
-    let entity_map_val = cs.get("entityMap").or_else(|| cs.get("entity_map"));
-
-    let mut entity_map: HashMap<String, &Value> = HashMap::new();
-    if let Some(entity_map_val) = entity_map_val {
-        if let Some(arr) = entity_map_val.as_array() {
-            for item in arr {
-                let key = item.get("key").and_then(|v| {
-                    v.as_str()
-                        .map(ToString::to_string)
-                        .or_else(|| v.as_u64().map(|n| n.to_string()))
-                });
-
-                if let Some(key) = key {
-                    let entity_obj = item.get("value").unwrap_or(item);
-                    entity_map.insert(key, entity_obj);
-                }
-            }
-        } else if let Some(obj) = entity_map_val.as_object() {
-            for (k, v) in obj {
-                let entity_obj = v.get("value").unwrap_or(v);
-                entity_map.insert(k.clone(), entity_obj);
-            }
-        }
-    }
-    let mut lines: Vec<String> = Vec::new();
-
-    for block in blocks {
-        let block_type = block
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unstyled");
-        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-
-        let line = match block_type {
-            "header-one" => format!("# {text}"),
-            "header-two" => format!("## {text}"),
-            "header-three" => format!("### {text}"),
-            "header-four" => format!("#### {text}"),
-            "code-block" => format!("```\n{text}\n```"),
-            "unordered-list-item" => format!("- {text}"),
-            "ordered-list-item" => format!("1. {text}"),
-            "blockquote" => format!("> {text}"),
-            "atomic" => {
-                if let Some(atomic_str) = render_atomic_block(block, &entity_map, media_map) {
-                    atomic_str
-                } else {
-                    continue;
-                }
-            }
-            _ => text.to_string(),
-        };
-
-        if !line.trim().is_empty() {
-            lines.push(line);
-        }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n\n"))
-    }
-}
-
-fn render_atomic_block(
-    block: &Value,
-    entity_map: &HashMap<String, &Value>,
-    media_map: &HashMap<String, String>,
-) -> Option<String> {
-    let ranges = block.get("entityRanges")?.as_array()?;
-    if ranges.is_empty() {
-        return None;
-    }
-
-    let key_val = ranges.first()?.get("key")?;
-    let key = key_val
-        .as_str()
-        .map(ToString::to_string)
-        .or_else(|| key_val.as_u64().map(|n| n.to_string()))
-        .or_else(|| key_val.as_i64().map(|n| n.to_string()))?;
-
-    let entity = entity_map.get(&key)?;
-    let entity_type = entity.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match entity_type {
-        "MEDIA" | "IMAGE" => {
-            let media_id_val = entity
-                .pointer("/data/mediaItems/0/mediaId")
-                .or_else(|| entity.pointer("/data/mediaId"));
-
-            let media_id_str = media_id_val.and_then(|v| {
-                v.as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| v.as_u64().map(|n| n.to_string()))
-                    .or_else(|| v.as_i64().map(|n| n.to_string()))
-            });
-
-            let img_url = media_id_str
-                .as_deref()
-                .and_then(|id| media_map.get(id))
-                .map(String::as_str)
-                .or_else(|| {
-                    entity
-                        .pointer("/data/media_url_https")
-                        .or_else(|| entity.pointer("/data/url"))
-                        .or_else(|| entity.pointer("/data/src"))
-                        .or_else(|| entity.pointer("/data/image/url"))
-                        .and_then(|v| v.as_str())
-                });
-            if let Some(url) = img_url {
-                Some(format!("![Image]({url})"))
-            } else {
-                Some("[Image]".to_string())
-            }
-        }
-        "MARKDOWN" => entity
-            .pointer("/data/markdown")
-            .and_then(|v| v.as_str())
-            .map(ToString::to_string),
-        "DIVIDER" => Some("---".to_string()),
-        "TWEET" => entity
-            .pointer("/data/tweetId")
-            .and_then(|v| v.as_str())
-            .map(|id| format!("[Embedded Tweet: https://x.com/i/status/{id}]")),
-        "LINK" => entity
-            .pointer("/data/url")
-            .and_then(|v| v.as_str())
-            .map(|url| format!("[{url}]({url})")),
-        _ => None,
-    }
-}
-
-fn extract_author(target: &Value) -> (String, String) {
-    let user_res = target
-        .pointer("/core/user_results/result")
-        .or_else(|| target.pointer("/user_results/result"))
-        .or_else(|| target.pointer("/core/user_result/result"))
-        .or_else(|| target.pointer("/user_result/result"));
-
-    if let Some(res) = user_res {
-        let user_target = if res.get("__typename").and_then(|v| v.as_str())
-            == Some("UserWithVisibilityResults")
-        {
-            res.get("user").unwrap_or(res)
-        } else {
-            res
-        };
-
-        let handle = user_target
-            .pointer("/core/screen_name")
-            .or_else(|| user_target.pointer("/legacy/screen_name"))
-            .or_else(|| user_target.get("screen_name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-
-        let name = user_target
-            .pointer("/core/name")
-            .or_else(|| user_target.pointer("/legacy/name"))
-            .or_else(|| user_target.get("name"))
-            .and_then(|v| v.as_str())
-            .unwrap_or(&handle)
-            .to_string();
-
-        return (name, handle);
-    }
-
-    ("unknown".to_string(), "unknown".to_string())
-}
-
-fn extract_media_urls(target: &Value) -> Vec<String> {
-    let mut urls = Vec::new();
-
-    let article_target = target
-        .pointer("/article/article_results/result")
-        .unwrap_or(target);
-
-    // 1. Article media_entities
-    if let Some(media_entities) = article_target
-        .get("media_entities")
-        .and_then(|v| v.as_array())
-    {
-        for m in media_entities {
-            let img_url = m
-                .pointer("/media_info/original_img_url")
-                .or_else(|| m.get("media_url_https"))
-                .and_then(|v| v.as_str());
-
-            if let Some(url) = img_url
-                && !urls.contains(&url.to_string())
-            {
-                urls.push(url.to_string());
-            }
-        }
-    }
-
-    // 2. Article cover media
-    if let Some(url) = article_target
-        .pointer("/cover_media/media_url_https")
-        .or_else(|| article_target.pointer("/cover_media/media_info/original_img_url"))
-        .and_then(|v| v.as_str())
-        && !urls.contains(&url.to_string())
-    {
-        urls.push(url.to_string());
-    }
-
-    // 3. Legacy / extended_entities media
-    let media_array = target
-        .pointer("/legacy/extended_entities/media")
-        .or_else(|| target.pointer("/legacy/entities/media"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = media_array {
-        for m in arr {
-            if let Some(url) = m.get("media_url_https").and_then(|v| v.as_str())
-                && !urls.contains(&url.to_string())
-            {
-                urls.push(url.to_string());
-            }
-        }
-    }
-
-    urls
-}
-
 async fn download_tweet_media(
     client: &reqwest::Client,
     detail: &mut TweetDetail,
     output_path: &Path,
 ) -> Result<()> {
-    let base_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let base_dir = parent_or_current(output_path);
     let media_dir = base_dir.join("media");
     fs::create_dir_all(&media_dir).context("failed to create media directory")?;
 
     let spinner = ui::create_spinner("downloading status images...");
-
     let mut downloaded = 0;
-    for (idx, media_url) in detail.media_urls.iter().enumerate() {
-        let ext = media_url
-            .split('.')
-            .next_back()
-            .unwrap_or("jpg")
-            .split('?')
-            .next()
-            .unwrap_or("jpg");
-        let file_name = format!("{}_{}_{}.{}", detail.author_handle, detail.id, idx + 1, ext);
-        let dest_path = media_dir.join(&file_name);
+    let mut skipped = 0;
+    let mut failed = 0;
+    let mut available_media = Vec::new();
+    let mut jobs = Vec::new();
 
-        if !dest_path.exists()
-            && let Ok(resp) = client.get(media_url).send().await
-            && let Ok(bytes) = resp.bytes().await
-        {
-            let _ = fs::write(&dest_path, bytes);
+    for (index, media_url) in detail.media_urls.iter().enumerate() {
+        let extension = media_extension(media_url);
+        let file_name = format!(
+            "{}_{}_{}.{}",
+            detail.author_handle,
+            detail.id,
+            index + 1,
+            extension
+        );
+        let destination = media_dir.join(&file_name);
+        let relative_path = format!("./media/{file_name}");
+
+        if destination.exists() {
+            skipped += 1;
+            available_media.push((index, media_url.clone(), relative_path));
+        } else {
+            jobs.push(MediaJob {
+                media_index: index,
+                url: media_url.clone(),
+                destination,
+                relative_path,
+            });
         }
+    }
 
-        if dest_path.exists() {
-            downloaded += 1;
-            let rel_path = format!("./media/{file_name}");
-            detail.local_media.push(rel_path.clone());
-            // Replace remote image url with local relative path in detail.text!
-            detail.text = detail.text.replace(media_url, &rel_path);
+    let job_count = jobs.len();
+    let mut pending = jobs.into_iter();
+    let mut tasks = tokio::task::JoinSet::new();
+    for job in pending.by_ref().take(MAX_CONCURRENT_MEDIA_REQUESTS) {
+        spawn_media_download(&mut tasks, client.clone(), job);
+    }
+
+    let mut completed = 0;
+    while let Some(joined) = tasks.join_next().await {
+        completed += 1;
+        spinner.set_message(format!(
+            "downloading status images ({completed}/{job_count})"
+        ));
+        match joined {
+            Ok((job, Ok(()))) => {
+                downloaded += 1;
+                available_media.push((job.media_index, job.url, job.relative_path));
+            }
+            Ok((job, Err(error))) => {
+                failed += 1;
+                ui::warn(format!("could not download {}: {error:#}", job.url));
+            }
+            Err(error) => {
+                failed += 1;
+                ui::warn(format!("media download task failed: {error}"));
+            }
+        }
+        if let Some(job) = pending.next() {
+            spawn_media_download(&mut tasks, client.clone(), job);
+        }
+    }
+
+    available_media.sort_unstable_by_key(|(media_index, _, _)| *media_index);
+    for (_, media_url, relative_path) in available_media {
+        if !detail.local_media.contains(&relative_path) {
+            detail.local_media.push(relative_path.clone());
+        }
+        detail.text = detail.text.replace(&media_url, &relative_path);
+        let encoded_url = markdown_destination(&media_url);
+        if encoded_url != media_url {
+            detail.text = detail.text.replace(&encoded_url, &relative_path);
         }
     }
 
     spinner.finish_and_clear();
     ui::success(format!(
-        "downloaded {downloaded} media images to {}",
+        "media: {downloaded} downloaded, {skipped} reused, {failed} failed; directory {}",
         ui::style_bold(&media_dir.display().to_string())
     ));
     Ok(())
 }
 
-fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat) -> Result<()> {
-    match format {
-        ReadOutputFormat::Markdown | ReadOutputFormat::Mdx => {
-            let mut content = String::new();
-
-            let display_title = detail.article_title.clone().unwrap_or_else(|| {
-                let first_line = detail.text.lines().next().unwrap_or(&detail.author_name);
-                first_line.chars().take(80).collect()
-            });
-
-            content.push_str("---\n");
-            content.push_str(&format!(
-                "title: {}\n",
-                serde_json::to_string(&display_title).unwrap_or_default()
-            ));
-            content.push_str(&format!(
-                "author: \"{} (@{})\"\n",
-                detail.author_name, detail.author_handle
-            ));
-            content.push_str(&format!("url: \"{}\"\n", detail.url));
-            content.push_str(&format!("date: \"{}\"\n", detail.created_at));
-            content.push_str(&format!("type: \"{}\"\n", detail.tweet_type));
-            content.push_str("---\n\n");
-
-            if let Some(ref title) = detail.article_title {
-                content.push_str(&format!("# 📰 {title}\n\n"));
-            }
-
-            content.push_str(&detail.text);
-            content.push_str("\n\n");
-
-            if !detail.text.contains("![Image") {
-                if !detail.local_media.is_empty() {
-                    content.push_str("### 🖼️ Attached Media\n\n");
-                    for (idx, img_path) in detail.local_media.iter().enumerate() {
-                        content.push_str(&format!("![Image {}]({img_path})\n\n", idx + 1));
-                    }
-                } else if !detail.media_urls.is_empty() {
-                    content.push_str("### 🖼️ Attached Media\n\n");
-                    for (idx, img_url) in detail.media_urls.iter().enumerate() {
-                        content.push_str(&format!("![Image {}]({img_url})\n\n", idx + 1));
-                    }
-                }
-            }
-
-            fs::write(path, content).context("failed to write Markdown/MDX file")?;
+fn spawn_media_download(
+    tasks: &mut tokio::task::JoinSet<(MediaJob, Result<()>)>,
+    client: reqwest::Client,
+    job: MediaJob,
+) {
+    tasks.spawn(async move {
+        let result = async {
+            let response = client.get(&job.url).send().await?.error_for_status()?;
+            let bytes = response.bytes().await?;
+            let destination = job.destination.clone();
+            tokio::task::spawn_blocking(move || atomic_write(&destination, &bytes))
+                .await
+                .context("media persistence task failed")?
         }
+        .await;
+        (job, result)
+    });
+}
+
+fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat) -> Result<()> {
+    let content = match format {
+        ReadOutputFormat::Markdown => render_markdown(detail)?,
+        ReadOutputFormat::Mdx => render_mdx(detail)?,
         ReadOutputFormat::Json => {
-            let json =
-                serde_json::to_string_pretty(detail).context("failed to serialize JSON output")?;
-            fs::write(path, json).context("failed to write JSON file")?;
+            serde_json::to_string_pretty(detail).context("failed to serialize JSON output")?
+        }
+    };
+
+    atomic_write(path, content.as_bytes())
+        .with_context(|| format!("failed to write X status output {}", path.display()))
+}
+
+fn render_markdown(detail: &TweetDetail) -> Result<String> {
+    render_markup(detail, false)
+}
+
+fn render_mdx(detail: &TweetDetail) -> Result<String> {
+    render_markup(detail, true)
+}
+
+fn render_markup(detail: &TweetDetail, mdx_safe: bool) -> Result<String> {
+    let mut content = String::new();
+    let display_title = detail.article_title.as_deref().map_or_else(
+        || {
+            let first_line = detail.text.lines().next().unwrap_or(&detail.author_name);
+            markdown_text_to_plain(first_line)
+                .chars()
+                .take(80)
+                .collect()
+        },
+        ToOwned::to_owned,
+    );
+    let author = format!("{} (@{})", detail.author_name, detail.author_handle);
+
+    content.push_str("---\n");
+    write_frontmatter_value(&mut content, "title", &display_title)?;
+    write_frontmatter_value(&mut content, "author", &author)?;
+    write_frontmatter_value(&mut content, "url", &detail.url)?;
+    write_frontmatter_value(&mut content, "date", &detail.created_at)?;
+    write_frontmatter_value(
+        &mut content,
+        "content_type",
+        &detail.content_type.to_string(),
+    )?;
+    write_frontmatter_sequence(
+        &mut content,
+        "subtypes",
+        detail.subtypes.iter().map(ToString::to_string),
+    )?;
+    // Retained so existing consumers can migrate from the original reader schema.
+    write_frontmatter_value(&mut content, "type", &detail.tweet_type.to_string())?;
+    content.push_str("---\n\n");
+
+    if let Some(title) = &detail.article_title {
+        writeln!(content, "# 📰 {}\n", escape_markdown_heading(title))
+            .context("failed to render article title")?;
+    }
+
+    let body = if mdx_safe {
+        Cow::Owned(sanitize_mdx(&detail.text))
+    } else {
+        Cow::Borrowed(detail.text.as_str())
+    };
+    content.push_str(&body);
+    content.push_str("\n\n");
+
+    let missing_media = resolved_media(detail)
+        .filter(|media| !media_is_embedded(&detail.text, media))
+        .collect::<Vec<_>>();
+    if !missing_media.is_empty() {
+        content.push_str("### 🖼️ Attached Media\n\n");
+        for (index, image) in missing_media.iter().enumerate() {
+            writeln!(
+                content,
+                "![Image {}]({})\n",
+                index + 1,
+                markdown_destination(image)
+            )
+            .context("failed to render attached media")?;
         }
     }
 
-    Ok(())
+    Ok(content)
+}
+
+fn escape_markdown_heading(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '`' | '*' | '_' | '[' | ']' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '{' => escaped.push_str("&#123;"),
+            '}' => escaped.push_str("&#125;"),
+            '\r' | '\n' => escaped.push(' '),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+fn markdown_text_to_plain(value: &str) -> String {
+    let value = value.replace("&lt;", "<").replace("&gt;", ">");
+    let mut plain = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' && characters.peek().is_some_and(char::is_ascii_punctuation) {
+            if let Some(next) = characters.next() {
+                plain.push(next);
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
+fn sanitize_mdx(value: &str) -> String {
+    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
+    let mut sanitized = String::with_capacity(value.len());
+    let mut open_fence = None;
+
+    for line in normalized.split_inclusive('\n') {
+        if let Some(fence) = open_fence {
+            sanitized.push_str(line);
+            if is_closing_fence(line, fence) {
+                open_fence = None;
+            }
+            continue;
+        }
+        if let Some(fence) = opening_fence(line) {
+            sanitized.push_str(line);
+            open_fence = Some(fence);
+            continue;
+        }
+
+        sanitize_mdx_line(line, &mut sanitized);
+    }
+    sanitized
+}
+
+#[derive(Clone, Copy)]
+struct MdxFence {
+    marker: u8,
+    length: usize,
+}
+
+fn opening_fence(line: &str) -> Option<MdxFence> {
+    let (marker, length, remainder) = fence_run(line)?;
+    if marker == b'`' && remainder.contains('`') {
+        return None;
+    }
+    Some(MdxFence { marker, length })
+}
+
+fn is_closing_fence(line: &str, opening: MdxFence) -> bool {
+    fence_run(line).is_some_and(|(marker, length, remainder)| {
+        marker == opening.marker
+            && length >= opening.length
+            && remainder.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+    })
+}
+
+fn fence_run(line: &str) -> Option<(u8, usize, &str)> {
+    let bytes = line.as_bytes();
+    let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let marker = *bytes.get(indentation)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = bytes[indentation..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (length >= 3).then(|| (marker, length, &line[indentation + length..]))
+}
+
+fn sanitize_mdx_line(line: &str, sanitized: &mut String) {
+    let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let body = &line[indent..];
+    sanitized.push_str(&line[..indent]);
+    if starts_mdx_esm(body) {
+        sanitized.push_str(if body.starts_with('i') {
+            "&#105;"
+        } else {
+            "&#101;"
+        });
+        sanitize_mdx_inline(&body[1..], sanitized);
+    } else {
+        sanitize_mdx_inline(body, sanitized);
+    }
+}
+
+fn starts_mdx_esm(value: &str) -> bool {
+    value.starts_with("import") || value.starts_with("export")
+}
+
+fn sanitize_mdx_inline(value: &str, sanitized: &mut String) {
+    let mut cursor = 0;
+    let mut inline_code_delimiter = None;
+    let mut underline_depth = 0_u32;
+    let allow_underline = has_balanced_underline_tags(value);
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        if remaining.starts_with('`') {
+            let run = remaining.bytes().take_while(|byte| *byte == b'`').count();
+            let escaped = backtick_is_escaped(value, cursor);
+            sanitized.push_str(&remaining[..run]);
+            inline_code_delimiter =
+                next_code_span_state(inline_code_delimiter, escaped, run, &remaining[run..]);
+            cursor += run;
+            continue;
+        }
+
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if inline_code_delimiter.is_some() {
+            sanitized.push(character);
+            cursor += character.len_utf8();
+            continue;
+        }
+        if allow_underline && remaining.starts_with("<u>") {
+            underline_depth += 1;
+            sanitized.push_str("<u>");
+            cursor += 3;
+            continue;
+        }
+        if allow_underline && remaining.starts_with("</u>") && underline_depth > 0 {
+            underline_depth -= 1;
+            let tag_length = 4;
+            sanitized.push_str(&remaining[..tag_length]);
+            cursor += tag_length;
+            continue;
+        }
+        match character {
+            '{' => sanitized.push_str("&#123;"),
+            '}' => sanitized.push_str("&#125;"),
+            '<' => sanitized.push_str("&lt;"),
+            '>' => sanitized.push_str("&gt;"),
+            _ => sanitized.push(character),
+        }
+        cursor += character.len_utf8();
+    }
+}
+
+fn has_balanced_underline_tags(value: &str) -> bool {
+    let mut cursor = 0;
+    let mut inline_code_delimiter = None;
+    let mut depth = 0_u32;
+    let mut found = false;
+
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        if remaining.starts_with('`') {
+            let run = remaining.bytes().take_while(|byte| *byte == b'`').count();
+            inline_code_delimiter = next_code_span_state(
+                inline_code_delimiter,
+                backtick_is_escaped(value, cursor),
+                run,
+                &remaining[run..],
+            );
+            cursor += run;
+            continue;
+        }
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if inline_code_delimiter.is_some() {
+            cursor += character.len_utf8();
+            continue;
+        }
+        if remaining.starts_with("<u>") {
+            depth += 1;
+            found = true;
+            cursor += 3;
+            continue;
+        }
+        if remaining.starts_with("</u>") {
+            if depth == 0 {
+                return false;
+            }
+            depth -= 1;
+            cursor += 4;
+            continue;
+        }
+        cursor += character.len_utf8();
+    }
+    found && depth == 0
+}
+
+fn next_code_span_state(
+    current: Option<usize>,
+    escaped: bool,
+    delimiter_length: usize,
+    remainder: &str,
+) -> Option<usize> {
+    match current {
+        Some(opening) if opening == delimiter_length => None,
+        None if !escaped && has_closing_code_span(remainder, delimiter_length) => {
+            Some(delimiter_length)
+        }
+        state => state,
+    }
+}
+
+fn has_closing_code_span(mut value: &str, delimiter_length: usize) -> bool {
+    while let Some(start) = value.find('`') {
+        value = &value[start..];
+        let run = value.bytes().take_while(|byte| *byte == b'`').count();
+        if run == delimiter_length {
+            return true;
+        }
+        value = &value[run..];
+    }
+    false
+}
+
+fn backtick_is_escaped(value: &str, index: usize) -> bool {
+    value.as_bytes()[..index]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn media_is_embedded(text: &str, media: &str) -> bool {
+    text.contains(media) || text.contains(&markdown_destination(media))
+}
+
+fn resolved_media(detail: &TweetDetail) -> impl Iterator<Item = &str> {
+    detail.media_urls.iter().enumerate().map(|(index, remote)| {
+        let expected_local = format!(
+            "./media/{}_{}_{}.{}",
+            detail.author_handle,
+            detail.id,
+            index + 1,
+            media_extension(remote)
+        );
+        detail
+            .local_media
+            .iter()
+            .find(|local| local.as_str() == expected_local)
+            .map_or(remote.as_str(), String::as_str)
+    })
+}
+
+fn write_frontmatter_value(content: &mut String, key: &str, value: &str) -> Result<()> {
+    let value = serde_json::to_string(value)
+        .with_context(|| format!("failed to serialize frontmatter {key}"))?;
+    writeln!(content, "{key}: {value}")
+        .with_context(|| format!("failed to render frontmatter {key}"))
+}
+
+fn write_frontmatter_sequence(
+    content: &mut String,
+    key: &str,
+    values: impl IntoIterator<Item = String>,
+) -> Result<()> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let value = serde_json::to_string(&values)
+        .with_context(|| format!("failed to serialize frontmatter {key}"))?;
+    writeln!(content, "{key}: {value}")
+        .with_context(|| format!("failed to render frontmatter {key}"))
 }
 
 fn sanitize_filename(name: &str) -> String {
     let clean: String = name
         .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' || ('\u{4e00}'..='\u{9fa5}').contains(&c)
-            {
-                c
+        .map(|character| {
+            if character.is_alphanumeric() || character == '_' || character == '-' {
+                character
             } else {
                 '_'
             }
         })
         .collect();
 
-    let parts: Vec<&str> = clean.split('_').filter(|s| !s.is_empty()).collect();
-    let result = parts.join("_");
+    let mut result = String::with_capacity(clean.len());
+    for part in clean.split('_').filter(|part| !part.is_empty()) {
+        if !result.is_empty() {
+            result.push('_');
+        }
+        result.push_str(part);
+    }
     let truncated: String = result.chars().take(50).collect();
     if truncated.is_empty() {
         "post".to_string()
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clix_x_api::{ContentType, TweetType};
+
+    use super::{
+        ReadOutputFormat, TweetDetail, extract_tweet_id, markdown_text_to_plain, render_markdown,
+        render_mdx, sanitize_filename, write_tweet_file,
+    };
+
+    #[test]
+    fn tweet_id_requires_a_nonempty_id_and_an_x_host() {
+        assert_eq!(
+            extract_tweet_id("123456789").expect("numeric ID should parse"),
+            "123456789"
+        );
+        assert_eq!(
+            extract_tweet_id("https://x.com/alice/status/123456789?s=20")
+                .expect("X URL should parse"),
+            "123456789"
+        );
+        assert!(extract_tweet_id("").is_err());
+        assert!(extract_tweet_id("https://example.com/alice/status/123456789").is_err());
+        assert!(extract_tweet_id("https://x.com/alice/status/not-a-number").is_err());
+    }
+
+    #[test]
+    fn frontmatter_escapes_special_characters_and_writes_atomically() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("status.md");
+        let detail = TweetDetail {
+            id: "123".into(),
+            content_type: ContentType::Post,
+            subtypes: Vec::new(),
+            tweet_type: TweetType::Tweet,
+            author_name: "A \"quoted\"\nname".into(),
+            author_handle: "alice".into(),
+            text: "Body".into(),
+            article_title: None,
+            created_at: "Wed Oct 10 20:19:24 +0000 2018".into(),
+            url: "https://x.com/alice/status/123".into(),
+            media_urls: Vec::new(),
+            local_media: Vec::new(),
+        };
+
+        write_tweet_file(&detail, &path, ReadOutputFormat::Markdown)
+            .expect("Markdown should be written");
+        let output = std::fs::read_to_string(path).expect("Markdown should be readable");
+        assert!(output.contains("author: \"A \\\"quoted\\\"\\nname (@alice)\""));
+        assert!(output.contains("url: \"https://x.com/alice/status/123\""));
+        assert!(output.contains("content_type: \"post\""));
+        assert!(output.contains("subtypes: []"));
+        assert!(output.contains("type: \"Tweet\""));
+    }
+
+    #[test]
+    fn filename_formatting_is_bounded_and_stable() {
+        assert_eq!(sanitize_filename("  hello / 世界  "), "hello_世界");
+        assert_eq!(sanitize_filename("***"), "post");
+        assert_eq!(
+            markdown_text_to_plain(r"Cost \$100 for GPT\-5\.6 &lt;today&gt;"),
+            "Cost $100 for GPT-5.6 <today>"
+        );
+    }
+
+    #[test]
+    fn markdown_keeps_unembedded_and_failed_media_sources() {
+        let detail = TweetDetail {
+            id: "123".into(),
+            content_type: ContentType::Article,
+            subtypes: Vec::new(),
+            tweet_type: TweetType::Article,
+            author_name: "Alice".into(),
+            author_handle: "alice".into(),
+            text: "Inline\n\n![Image](./media/alice_123_1.jpg)".into(),
+            article_title: Some("Article".into()),
+            created_at: "Wed Oct 10 20:19:24 +0000 2018".into(),
+            url: "https://x.com/alice/status/123".into(),
+            media_urls: vec![
+                "https://pbs.twimg.com/media/inline.jpg".into(),
+                "https://pbs.twimg.com/media/cover.png".into(),
+                "https://pbs.twimg.com/media/failed.webp".into(),
+            ],
+            local_media: vec![
+                "./media/alice_123_1.jpg".into(),
+                "./media/alice_123_2.png".into(),
+            ],
+        };
+
+        let output = render_markdown(&detail).expect("Markdown should render");
+        assert_eq!(
+            output.matches("./media/alice_123_1.jpg").count(),
+            1,
+            "an inline image must not be duplicated"
+        );
+        assert!(output.contains("./media/alice_123_2.png"));
+        assert!(output.contains("https://pbs.twimg.com/media/failed.webp"));
+    }
+
+    #[test]
+    fn mdx_neutralizes_expressions_jsx_and_esm_but_preserves_code() {
+        let detail = TweetDetail {
+            id: "123".into(),
+            content_type: ContentType::Article,
+            subtypes: Vec::new(),
+            tweet_type: TweetType::Article,
+            author_name: "Alice".into(),
+            author_handle: "alice".into(),
+            text: concat!(
+                "export const value = {danger}\n\n",
+                "import/**/x from \"pkg\"\nexport/**/const y = 1\n\n",
+                "<Widget /> {name} `<Code /> {literal}`\n\n",
+                "```\nconst safe = {inside: true};\n```\n\n",
+                "```text\n~~~\n```\n<AfterFence /> {after}\n\n",
+                "```text\n```\u{00a0}\n```\n<AfterNbsp /> {nbsp}\n\n",
+                "~~~\r~~~\r<AfterCr /> {cr}\n\n",
+                "\\`literal <AfterEscape /> {escape}\\`\n\n",
+                "`code \\` <AfterCode /> {code}`\n\n",
+                "<u>paired</u>\n<u>orphan\n</u>orphan-close\n\n",
+                "<u><u>nested-orphan</u>\n\n",
+                "`unclosed <AfterTick /> {tick}"
+            )
+            .into(),
+            article_title: Some("<script>{title}</script>".into()),
+            created_at: "Wed Oct 10 20:19:24 +0000 2018".into(),
+            url: "https://x.com/alice/status/123".into(),
+            media_urls: Vec::new(),
+            local_media: Vec::new(),
+        };
+
+        let output = render_mdx(&detail).expect("MDX should render");
+        assert!(output.contains("# 📰 &lt;script&gt;&#123;title&#125;&lt;/script&gt;"));
+        assert!(output.contains("&#101;xport const value = &#123;danger&#125;"));
+        assert!(output.contains("&#105;mport/**/x from \"pkg\""));
+        assert!(output.contains("&#101;xport/**/const y = 1"));
+        assert!(output.contains("&lt;Widget /&gt; &#123;name&#125;"));
+        assert!(output.contains("`<Code /> {literal}`"));
+        assert!(output.contains("const safe = {inside: true};"));
+        assert!(output.contains("&lt;AfterFence /&gt; &#123;after&#125;"));
+        assert!(output.contains("&lt;AfterNbsp /&gt; &#123;nbsp&#125;"));
+        assert!(output.contains("&lt;AfterCr /&gt; &#123;cr&#125;"));
+        assert!(output.contains("\\`literal &lt;AfterEscape /&gt; &#123;escape&#125;\\`"));
+        assert!(output.contains("`code \\` &lt;AfterCode /&gt; &#123;code&#125;`"));
+        assert!(output.contains("<u>paired</u>\n&lt;u&gt;orphan"));
+        assert!(output.contains("&lt;/u&gt;orphan-close"));
+        assert!(output.contains("&lt;u&gt;&lt;u&gt;nested-orphan&lt;/u&gt;"));
+        assert!(output.contains("`unclosed &lt;AfterTick /&gt; &#123;tick&#125;"));
     }
 }

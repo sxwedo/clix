@@ -14,11 +14,7 @@ struct StandaloneCli {
     args: ViewArgs,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::process::ExitCode {
     let cli = StandaloneCli::parse();
-    if let Err(err) = clix_view::run(cli.args).await {
-        ui::error(&err);
-        std::process::exit(1);
-    }
+    ui::exit_code(clix_view::run(cli.args))
 }

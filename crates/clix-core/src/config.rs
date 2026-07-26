@@ -1,63 +1,91 @@
-use std::env;
+use std::{env, time::Duration};
 use tokio::process::Command;
 
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn resolve_token(explicit_token: Option<String>) -> Option<String> {
-    if let Some(token) = explicit_token
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(token) = nonblank(explicit_token) {
         return Some(token);
     }
 
-    if let Ok(token) = env::var("GITHUB_TOKEN").or_else(|_| env::var("GH_TOKEN")) {
-        let trimmed = token.trim().to_string();
-        if !trimmed.is_empty() {
-            return Some(trimmed);
+    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Some(token) = nonblank(env::var(name).ok()) {
+            return Some(token);
         }
     }
 
-    // Attempt to get token from `gh auth token`
-    if let Ok(output) = Command::new("gh").args(["auth", "token"]).output().await {
-        let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if output.status.success() && !token.is_empty() {
-            return Some(token);
-        }
+    command_stdout("gh", &["auth", "token"]).await
+}
+
+pub async fn resolve_username(explicit_user: Option<String>) -> Option<String> {
+    if explicit_user.is_some() {
+        return nonblank(explicit_user).filter(|user| is_valid_github_login(user));
+    }
+
+    if let Some(user) = command_stdout("gh", &["api", "user", "-q", ".login"]).await
+        && is_valid_github_login(&user)
+    {
+        return Some(user);
+    }
+
+    if let Some(user) = command_stdout("git", &["config", "github.user"]).await
+        && is_valid_github_login(&user)
+    {
+        return Some(user);
     }
 
     None
 }
 
-pub async fn resolve_username(explicit_user: Option<String>) -> Option<String> {
-    if let Some(user) = explicit_user
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        return Some(user);
-    }
-
-    // Try `gh api user -q .login`
-    if let Ok(output) = Command::new("gh")
-        .args(["api", "user", "-q", ".login"])
-        .output()
+async fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let mut command = Command::new(program);
+    command.args(args).kill_on_drop(true);
+    let output = tokio::time::timeout(COMMAND_TIMEOUT, command.output())
         .await
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if output.status.success() && !stdout.is_empty() {
-            return Some(stdout);
-        }
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    nonblank(String::from_utf8(output.stdout).ok())
+}
+
+fn nonblank(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Return whether `value` is a syntactically valid GitHub login.
+#[must_use]
+pub fn is_valid_github_login(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 39
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        && !value.contains("--")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_github_login, nonblank};
+
+    #[test]
+    fn blank_values_are_rejected_after_trimming() {
+        assert_eq!(nonblank(Some("  ".into())), None);
+        assert_eq!(nonblank(Some(" octocat ".into())), Some("octocat".into()));
     }
 
-    // Fallback: `git config user.name`
-    if let Ok(output) = Command::new("git")
-        .args(["config", "user.name"])
-        .output()
-        .await
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if output.status.success() && !stdout.is_empty() {
-            return Some(stdout);
-        }
+    #[test]
+    fn github_login_validation_rejects_display_names_and_bad_hyphens() {
+        assert!(is_valid_github_login("octocat"));
+        assert!(is_valid_github_login("github-user-1"));
+        assert!(!is_valid_github_login("John Doe"));
+        assert!(!is_valid_github_login("-octocat"));
+        assert!(!is_valid_github_login("octo--cat"));
     }
-
-    None
 }

@@ -7,20 +7,21 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, modular CLI suite written in Rust designed to streamline daily developer tasks, GitHub workflows, social media tools, and system utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: Every tool can be run via the unified CLI (`clix gh stars`) or directly as a standalone binary (`clix-gh-stars`).
-- **Zero-Config Auth**: Automatically detects tokens via `gh auth token` or `GITHUB_TOKEN` env var, and usernames via `gh` or `git config`.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix x bookmarks`, `clix x read`, `clix view`) or a standalone binary.
+- **Zero-Config GitHub Auth**: Detects `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`; usernames come from the authenticated `gh` account or an explicit `github.user`.
 
 ## Commands
 
 All verification gates are defined as `mise` tasks in `.mise.toml`:
 
 ```sh
-mise run verify        # fmt + check + test + clippy (full local gate)
-mise run fmt           # cargo fmt -- --check
-mise run check         # cargo check --workspace
-mise run test          # cargo test --workspace
-mise run clippy        # cargo clippy --workspace --all-targets -- -D warnings
-mise run build         # cargo build --release
+mise run verify        # fmt + check + test + clippy + docs (full local gate)
+mise run fmt           # cargo fmt --all -- --check
+mise run check         # cargo check --workspace --locked
+mise run test          # cargo test --workspace --locked
+mise run clippy        # warnings + Clippy pedantic/nursery are denied
+mise run docs          # rustdoc with warnings denied
+mise run build         # cargo build --workspace --release --locked
 ```
 
 Run a single test: `cargo test <name_substring> -- --nocapture`
@@ -33,27 +34,24 @@ The project follows a Cargo Workspace layout under `crates/`:
 
 ```
 clix/
-  ├── Cargo.toml                    # Root workspace manifest
-  ├── .mise.toml                    # Task runner & toolchain configuration
+  ├── Cargo.toml              # Root workspace manifest and shared dependencies
+  ├── .mise.toml              # Verification and build tasks
   ├── crates/
-  │     ├── clix-core/              # Shared UI (anstyle/indicatif) & config (token/user detection)
-  │     │     ├── src/lib.rs
-  │     │     ├── src/ui.rs
-  │     │     └── src/config.rs
-  │     └── clix-gh-stars/          # GitHub stars exporter (lib + binary)
-  │           ├── Cargo.toml
-  │           └── src/
-  │                 ├── lib.rs     # Exportable logic & StarsArgs
-  │                 └── main.rs    # Standalone `clix-gh-stars` binary entrypoint
-  └── src/
-        └── main.rs                 # Unified `clix` CLI dispatcher
+  │   ├── clix-core/          # Shared UI, filesystem, and GitHub config helpers
+  │   ├── clix-gh-stars/      # GitHub stars exporter
+  │   ├── clix-view/          # Terminal Markdown/MDX viewer
+  │   ├── clix-x-api/         # Shared X auth, GraphQL parsing, and content/media types
+  │   ├── clix-x-bookmarks/   # X bookmarks exporter
+  │   └── clix-x-read/        # Single X status/article reader
+  └── src/main.rs             # Unified `clix` dispatcher
 ```
 
 ### Key Design Points
 
-- **`clix-core` (Shared Infrastructure):** Contains shared terminal styling (`anstyle`), animated spinners (`indicatif`), and authentication/username detection helpers (`config::resolve_token`, `config::resolve_username`).
-- **`clix-gh-stars` (Feature Crate):** Implements async pagination over GitHub's API via `reqwest` + `tokio`. Export formats (Markdown, URLs, JSON) are defined in `write_output`.
-- **Root Binary (`clix`):** Uses `clap` to route subcommands (`clix gh stars`) directly to feature crate functions (`clix_gh_stars::run(args)`).
+- **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, and GitHub token/username resolution.
+- **`clix-x-api` (Shared X Infrastructure):** Owns X credentials, HTTP client setup, GraphQL parsing, media helpers, and the common content taxonomy.
+- **Feature Crates:** Each user-facing tool exposes its argument type and `run` entrypoint while retaining a standalone binary.
+- **Root Binary (`clix`):** Uses `clap` to dispatch unified subcommands directly to feature crates.
 
 ## Adding a New Tool
 
@@ -64,7 +62,7 @@ To add a new tool `clix-<service>-<name>` to the workspace:
    mkdir -p crates/clix-<service>-<name>/src
    ```
 2. Add `"crates/clix-<service>-<name>"` to `[workspace.members]` in root `Cargo.toml`.
-3. Reference `clix-core = { path = "../clix-core" }` in `crates/clix-<service>-<name>/Cargo.toml`.
-4. Implement the tool in `crates/clix-<service>-<name>/src/lib.rs`, exposing a `pub struct Args` and `pub async fn run(args: Args) -> Result<()>`.
+3. Inherit common package/dependency values from the root workspace and add only the required path dependencies.
+4. Implement the tool in `crates/clix-<service>-<name>/src/lib.rs`, exposing its argument type and a `run` entrypoint (async only when the work requires it).
 5. Add `crates/clix-<service>-<name>/src/main.rs` for standalone binary execution (`clix-<service>-<name>`).
 6. Register the subcommand in root `src/main.rs` under `enum Commands` and the service-specific enum (`enum GhCommands`, `enum XCommands`, etc.).

@@ -1,107 +1,113 @@
+mod api;
+mod media;
+mod model;
+mod output;
+
 use std::{
-    env, fmt, fs,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, bail};
-use clap::{Args, ValueEnum};
+use anyhow::{Result, bail};
 use clix_core::ui;
-use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+pub use clix_x_api::{ContentSubtype, ContentType};
+use clix_x_api::{XCredentials, build_media_client};
 
-const TWITTER_BEARER_TOKEN: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+use api::{
+    apply_cached_article_titles, article_link_index, bookmark_features_json, enrich_article_titles,
+    fetch_bookmarks,
+};
+#[cfg(test)]
+use api::{extract_tweet, has_bookmark_timeline, page_is_known_boundary, parse_bookmarks_response};
+use media::download_all_media;
+use model::BookmarkState;
+pub use model::{BookmarksArgs, LinkPreview, OutputFormat, TweetBookmark, TweetMetrics};
+use output::{
+    ExistingOutput, acquire_export_locks, append_output, default_state_path, ensure_distinct_paths,
+    load_state_cache, write_output, write_state,
+};
+#[cfg(test)]
+use output::{format_tweet_cell, markdown_status_ids_and_count, render_output};
 
-const QUERY_IDS: &[&str] = &["RV1g3b8n_SGOHwkqKYSCFw", "tmd4ifV8RHltzn8ymGg1aw"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum OutputFormat {
-    Markdown,
-    Urls,
-    Json,
+#[derive(Default)]
+struct PreviousExport {
+    existing_output: Option<ExistingOutput>,
+    known_ids: HashSet<String>,
+    article_titles: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TweetType {
-    Article,
-    NoteTweet,
-    Video,
-    Photo,
-    Quote,
-    Reply,
-    Tweet,
-}
-
-impl fmt::Display for TweetType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Article => write!(f, "Article"),
-            Self::NoteTweet => write!(f, "NoteTweet"),
-            Self::Video => write!(f, "Video"),
-            Self::Photo => write!(f, "Photo"),
-            Self::Quote => write!(f, "Quote"),
-            Self::Reply => write!(f, "Reply"),
-            Self::Tweet => write!(f, "Tweet"),
-        }
+fn load_previous_export(
+    output_path: &Path,
+    state_path: &Path,
+    format: OutputFormat,
+    incremental: bool,
+) -> Result<PreviousExport> {
+    if !output_path.exists() {
+        return Ok(PreviousExport::default());
     }
+
+    let existing_output = match ExistingOutput::load(output_path, format) {
+        Ok(existing) => Some(existing),
+        Err(error) if incremental => return Err(error),
+        Err(error) => {
+            ui::warn(format!(
+                "could not reuse existing Article titles from {}: {error:#}",
+                output_path.display()
+            ));
+            None
+        }
+    };
+    let (state_ids, state_titles) = match load_state_cache(state_path) {
+        Ok(cache) => cache,
+        Err(error) if incremental => return Err(error),
+        Err(error) => {
+            ui::warn(format!(
+                "could not reuse bookmark state from {}: {error:#}",
+                state_path.display()
+            ));
+            (HashSet::new(), BTreeMap::new())
+        }
+    };
+    let mut article_titles = existing_output
+        .as_ref()
+        .map(ExistingOutput::article_titles)
+        .unwrap_or_default();
+    article_titles.extend(state_titles);
+    let mut known_ids = if incremental {
+        state_ids
+    } else {
+        HashSet::new()
+    };
+    if let Some(existing) = &existing_output
+        && incremental
+    {
+        known_ids.extend(existing.ids().iter().cloned());
+    }
+
+    Ok(PreviousExport {
+        existing_output,
+        known_ids,
+        article_titles,
+    })
 }
 
-#[derive(Debug, Args)]
-pub struct BookmarksArgs {
-    /// Twitter auth_token cookie (or set X_AUTH_TOKEN / TWITTER_AUTH_TOKEN env)
-    #[arg(long)]
-    pub auth_token: Option<String>,
-
-    /// Twitter ct0 (CSRF) cookie (or set X_CT0 / TWITTER_CT0 env)
-    #[arg(long)]
-    pub ct0: Option<String>,
-
-    /// Output file path (default: x_bookmarks.md)
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-
-    /// Output format: markdown, urls, or json
-    #[arg(short, long, value_enum, default_value_t = OutputFormat::Markdown)]
-    pub format: OutputFormat,
-
-    /// Maximum number of bookmarks to fetch (default: all)
-    #[arg(short = 'n', long)]
-    pub count: Option<usize>,
-
-    /// Download attached media (images/photos) locally into a `media/` folder
-    #[arg(long)]
-    pub download_media: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TweetBookmark {
-    pub id: String,
-    pub tweet_type: TweetType,
-    pub author_name: String,
-    pub author_handle: String,
-    pub text: String,
-    pub created_at: String,
-    pub url: String,
-    #[serde(default)]
-    pub media: Vec<String>,
-    #[serde(default)]
-    pub local_media: Vec<String>,
-}
-
+/// Export the authenticated X account's bookmarks.
+///
+/// # Errors
+///
+/// Returns an error for missing credentials, invalid output/state paths,
+/// unsuccessful X requests, incompatible incremental output, media-directory
+/// failures, or output/state serialization and write failures.
 pub async fn run(args: BookmarksArgs) -> Result<()> {
-    let auth_token = resolve_auth_token(args.auth_token);
-    let ct0 = resolve_ct0(args.ct0);
-
-    let (auth_token, ct0) = match (auth_token, ct0) {
-        (Some(a), Some(c)) => (a, c),
-        _ => bail!(
+    let Some(credentials) = XCredentials::resolve(args.auth_token, args.ct0) else {
+        bail!(
             "Missing X authentication credentials!\n\n\
              Please provide both credentials via CLI flags or env vars:\n  \
              clix x bookmarks --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n\n\
              Or set environment variables:\n  \
              export X_AUTH_TOKEN=\"...\"\n  \
              export X_CT0=\"...\""
-        ),
+        );
     };
 
     let output_path = args.output.unwrap_or_else(|| match args.format {
@@ -109,457 +115,776 @@ pub async fn run(args: BookmarksArgs) -> Result<()> {
         OutputFormat::Urls => PathBuf::from("x_bookmarks_urls.txt"),
         OutputFormat::Json => PathBuf::from("x_bookmarks.json"),
     });
+    let state_path = args
+        .state
+        .unwrap_or_else(|| default_state_path(&output_path));
+    ensure_distinct_paths(&output_path, &state_path)?;
+    let _export_locks = acquire_export_locks(&output_path, &state_path)?;
+    let PreviousExport {
+        existing_output,
+        mut known_ids,
+        mut article_titles,
+    } = load_previous_export(&output_path, &state_path, args.format, args.incremental)?;
 
-    let client = build_http_client(&auth_token, &ct0)?;
+    let client = credentials.build_client()?;
 
-    let spinner = ui::create_spinner("fetching X bookmarks...");
+    let mut bookmarks = fetch_bookmarks(
+        &client,
+        bookmark_features_json(),
+        args.count,
+        args.incremental,
+        &known_ids,
+    )
+    .await?;
 
-    let mut bookmarks = Vec::new();
-    let mut cursor: Option<String> = None;
-    let limit = args.count.unwrap_or(usize::MAX);
-
-    let features_json = serde_json::json!({
-        "graphql_timeline_v2_bookmark_timeline": true,
-        "responsive_web_graphql_exclude_directive_enabled": true,
-        "verified_phone_label_enabled": false,
-        "creator_subscriptions_tweet_preview_api_enabled": true,
-        "responsive_web_graphql_timeline_navigation_enabled": true,
-        "responsive_web_graphql_skip_user_profile_image_extensions_enabled": false,
-        "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": true,
-        "tweet_awards_web_tipping_enabled": false,
-        "freedom_of_speech_not_reach_fetch_enabled": true,
-        "standardized_nudges_misinfo": true,
-        "tweet_with_visibility_results_prefer_gql_media_interstitial_enabled": true,
-        "rweb_video_timestamps_enabled": true,
-        "longform_notetweets_rich_text_read_enabled": true,
-        "longform_notetweets_inline_media_enabled": true,
-        "responsive_web_enhance_cards_enabled": false
-    })
-    .to_string();
-
-    loop {
-        if bookmarks.len() >= limit {
-            break;
-        }
-
-        spinner.set_message(format!(
-            "fetching X bookmarks ({})",
-            ui::style_bold(&format!("{} fetched", bookmarks.len()))
-        ));
-
-        let page_count = std::cmp::min(20, limit - bookmarks.len());
-
-        let mut variables_json = serde_json::json!({
-            "count": page_count,
-            "includePromotedContent": false
-        });
-        if let Some(ref c) = cursor {
-            variables_json["cursor"] = serde_json::Value::String(c.clone());
-        }
-
-        let mut fetched_page = false;
-        let mut next_cursor: Option<String> = None;
-
-        for query_id in QUERY_IDS {
-            let url = format!(
-                "https://x.com/i/api/graphql/{query_id}/Bookmarks?variables={}&features={}",
-                urlencoding::encode(&variables_json.to_string()),
-                urlencoding::encode(&features_json)
-            );
-
-            let resp = match client.get(&url).send().await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-
-            let status = resp.status();
-            if !status.is_success() {
-                continue;
-            }
-
-            let body: Value = match resp.json().await {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let (page_tweets, page_cursor) = parse_bookmarks_response(&body);
-            if page_tweets.is_empty() && page_cursor.is_none() {
-                continue;
-            }
-
-            for tweet in page_tweets {
-                if bookmarks.len() < limit
-                    && !bookmarks.iter().any(|b: &TweetBookmark| b.id == tweet.id)
-                {
-                    bookmarks.push(tweet);
-                }
-            }
-
-            next_cursor = page_cursor;
-            fetched_page = true;
-            break;
-        }
-
-        if !fetched_page || next_cursor.is_none() || next_cursor == cursor {
-            break;
-        }
-
-        cursor = next_cursor;
-    }
-
-    spinner.finish_and_clear();
-
-    if bookmarks.is_empty() {
+    if bookmarks.is_empty() && !args.incremental {
         bail!(
             "No bookmarks found or failed to authenticate with X. Please verify your auth_token and ct0 values."
         );
     }
 
-    if args.download_media {
-        download_all_media(&client, &mut bookmarks, &output_path).await?;
+    apply_cached_article_titles(&mut bookmarks, &article_titles);
+    if !args.link_only {
+        enrich_article_titles(&client, &mut bookmarks).await;
     }
 
-    write_output(&bookmarks, &output_path, args.format)?;
+    if args.download_media {
+        let media_client = build_media_client()?;
+        download_all_media(&media_client, &mut bookmarks, &output_path).await?;
+    }
 
-    ui::success(format!(
-        "exported {} X bookmarks to {}",
-        ui::style_bold(&bookmarks.len().to_string()),
-        ui::style_bold(&output_path.display().to_string())
-    ));
+    if args.incremental {
+        append_output(
+            &bookmarks,
+            &output_path,
+            args.format,
+            args.link_only,
+            &known_ids,
+            existing_output.as_ref(),
+        )?;
+    } else {
+        write_output(&bookmarks, &output_path, args.format, args.link_only)?;
+        known_ids.clear();
+        article_titles.clear();
+    }
+
+    known_ids.extend(bookmarks.iter().map(|bookmark| bookmark.id.clone()));
+    for bookmark in &bookmarks {
+        if let Some(index) = article_link_index(bookmark)
+            && let Some(title) = &bookmark.links[index].title
+        {
+            article_titles.insert(bookmark.id.clone(), title.clone());
+        }
+    }
+    write_state(&state_path, &BookmarkState::new(known_ids, article_titles))?;
+
+    if args.incremental && bookmarks.is_empty() {
+        ui::success(format!(
+            "X bookmarks are already up to date; state saved to {}",
+            ui::style_bold(&state_path.display().to_string())
+        ));
+    } else {
+        let verb = if args.incremental {
+            "appended"
+        } else {
+            "exported"
+        };
+        ui::success(format!(
+            "{verb} {} X bookmarks to {}",
+            ui::style_bold(&bookmarks.len().to_string()),
+            ui::style_bold(&output_path.display().to_string())
+        ));
+    }
 
     Ok(())
 }
 
-fn resolve_auth_token(cli_val: Option<String>) -> Option<String> {
-    cli_val
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env::var("X_AUTH_TOKEN").ok())
-        .or_else(|| env::var("TWITTER_AUTH_TOKEN").ok())
-        .or_else(|| env::var("AUTH_TOKEN").ok())
-        .map(|s| s.trim().to_string())
-}
-
-fn resolve_ct0(cli_val: Option<String>) -> Option<String> {
-    cli_val
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| env::var("X_CT0").ok())
-        .or_else(|| env::var("TWITTER_CT0").ok())
-        .or_else(|| env::var("CT0").ok())
-        .map(|s| s.trim().to_string())
-}
-
-fn build_http_client(auth_token: &str, ct0: &str) -> Result<reqwest::Client> {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "authorization",
-        HeaderValue::from_str(TWITTER_BEARER_TOKEN).context("invalid bearer token")?,
-    );
-    headers.insert(
-        "cookie",
-        HeaderValue::from_str(&format!("auth_token={auth_token}; ct0={ct0}"))
-            .context("invalid cookie header")?,
-    );
-    headers.insert(
-        "x-csrf-token",
-        HeaderValue::from_str(ct0).context("invalid csrf token header")?,
-    );
-    headers.insert("x-twitter-active-user", HeaderValue::from_static("yes"));
-    headers.insert("x-twitter-client-language", HeaderValue::from_static("en"));
-    headers.insert(
-        "user-agent",
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ),
-    );
-
-    reqwest::Client::builder()
-        .default_headers(headers)
-        .build()
-        .context("failed to build HTTP client for X")
-}
-
-fn parse_bookmarks_response(val: &Value) -> (Vec<TweetBookmark>, Option<String>) {
-    let mut tweets = Vec::new();
-    let mut next_cursor = None;
-
-    let instructions = val
-        .pointer("/data/bookmark_timeline_v2/timeline/instructions")
-        .or_else(|| val.pointer("/data/bookmark_timeline/timeline/instructions"))
-        .and_then(|v| v.as_array());
-
-    if let Some(instructions) = instructions {
-        for inst in instructions {
-            let entries = inst.get("entries").and_then(|v| v.as_array());
-            if let Some(entries) = entries {
-                for entry in entries {
-                    // Check for bottom cursor
-                    let entry_id = entry.get("entryId").and_then(|v| v.as_str()).unwrap_or("");
-                    let cursor_type = entry
-                        .pointer("/content/cursorType")
-                        .and_then(|v| v.as_str());
-
-                    if (entry_id.starts_with("cursor-bottom-") || cursor_type == Some("Bottom"))
-                        && let Some(val) = entry.pointer("/content/value").and_then(|v| v.as_str())
-                    {
-                        next_cursor = Some(val.to_string());
-                    }
-
-                    // Extract tweet item
-                    let tweet_result = entry
-                        .pointer("/content/itemContent/tweet_results/result")
-                        .or_else(|| entry.pointer("/item/itemContent/tweet_results/result"));
-
-                    if let Some(tweet) = tweet_result.and_then(extract_tweet) {
-                        tweets.push(tweet);
-                    }
-                }
-            }
-        }
-    }
-
-    (tweets, next_cursor)
-}
-
-fn extract_tweet(res: &Value) -> Option<TweetBookmark> {
-    // Handle TweetWithVisibilityResults wrapper
-    let target =
-        if res.get("__typename").and_then(|v| v.as_str()) == Some("TweetWithVisibilityResults") {
-            res.get("tweet")?
-        } else {
-            res
-        };
-
-    let id = target.get("rest_id")?.as_str()?.to_string();
-
-    let user_legacy = target.pointer("/core/user_results/result/legacy");
-    let author_handle = user_legacy
-        .and_then(|u| u.get("screen_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
-    let author_name = user_legacy
-        .and_then(|u| u.get("name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&author_handle)
-        .to_string();
-
-    let article_title = target
-        .pointer("/article/article_results/result/title")
-        .or_else(|| target.pointer("/article/title"))
-        .and_then(|v| v.as_str());
-
-    let raw_text = target
-        .pointer("/note_tweet/note_tweet_results/result/text")
-        .and_then(|v| v.as_str())
-        .or_else(|| target.pointer("/legacy/full_text").and_then(|v| v.as_str()))
-        .unwrap_or("");
-
-    let text = if let Some(title) = article_title {
-        format!("📰 [{title}] {raw_text}")
-    } else {
-        raw_text.to_string()
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::{BTreeMap, HashSet},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
-    let created_at = target
-        .pointer("/legacy/created_at")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
+    use serde_json::json;
 
-    let media = extract_media_urls(target);
-    let tweet_type = determine_tweet_type(target, article_title.is_some(), &media);
-    let url = format!("https://x.com/{author_handle}/status/{id}");
+    use super::{
+        BookmarkState, ContentSubtype, ContentType, ExistingOutput, LinkPreview, OutputFormat,
+        TweetBookmark, TweetMetrics, acquire_export_locks, append_output, article_link_index,
+        default_state_path, ensure_distinct_paths, extract_tweet, format_tweet_cell,
+        has_bookmark_timeline, load_previous_export, load_state_cache,
+        markdown_status_ids_and_count, page_is_known_boundary, parse_bookmarks_response,
+        render_output, write_output, write_state,
+    };
 
-    Some(TweetBookmark {
-        id,
-        tweet_type,
-        author_name,
-        author_handle,
-        text,
-        created_at,
-        url,
-        media,
-        local_media: Vec::new(),
-    })
-}
-
-fn determine_tweet_type(target: &Value, is_article: bool, media: &[String]) -> TweetType {
-    if is_article {
-        return TweetType::Article;
-    }
-
-    if target.pointer("/note_tweet").is_some() {
-        return TweetType::NoteTweet;
-    }
-
-    let media_array = target
-        .pointer("/legacy/extended_entities/media")
-        .or_else(|| target.pointer("/legacy/entities/media"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = media_array {
-        for m in arr {
-            if let Some(kind) = m.get("type").and_then(|v| v.as_str())
-                && (kind == "video" || kind == "animated_gif")
-            {
-                return TweetType::Video;
-            }
-        }
-        if !media.is_empty() {
-            return TweetType::Photo;
-        }
-    }
-
-    if target
-        .pointer("/legacy/is_quote_status")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || target.pointer("/quoted_status_result").is_some()
-    {
-        return TweetType::Quote;
-    }
-
-    if target
-        .pointer("/legacy/in_reply_to_status_id_str")
-        .and_then(|v| v.as_str())
-        .is_some()
-    {
-        return TweetType::Reply;
-    }
-
-    TweetType::Tweet
-}
-
-fn extract_media_urls(target: &Value) -> Vec<String> {
-    let mut urls = Vec::new();
-
-    // 1. Article cover media
-    if let Some(url) = target
-        .pointer("/article/cover_media/media_url_https")
-        .or_else(|| target.pointer("/article/article_results/result/cover_media/media_url_https"))
-        .and_then(|v| v.as_str())
-    {
-        urls.push(url.to_string());
-    }
-
-    // 2. Legacy / extended_entities media
-    let media_array = target
-        .pointer("/legacy/extended_entities/media")
-        .or_else(|| target.pointer("/legacy/entities/media"))
-        .and_then(|v| v.as_array());
-
-    if let Some(arr) = media_array {
-        for m in arr {
-            if let Some(url) = m.get("media_url_https").and_then(|v| v.as_str())
-                && !urls.contains(&url.to_string())
-            {
-                urls.push(url.to_string());
-            }
-        }
-    }
-
-    urls
-}
-
-async fn download_all_media(
-    client: &reqwest::Client,
-    bookmarks: &mut [TweetBookmark],
-    output_path: &Path,
-) -> Result<()> {
-    let base_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let media_dir = base_dir.join("media");
-    fs::create_dir_all(&media_dir).context("failed to create media directory")?;
-
-    let spinner = ui::create_spinner("downloading attached media images...");
-
-    let mut downloaded = 0;
-    for b in bookmarks.iter_mut() {
-        for (idx, media_url) in b.media.iter().enumerate() {
-            let ext = media_url
-                .split('.')
-                .next_back()
-                .unwrap_or("jpg")
-                .split('?')
-                .next()
-                .unwrap_or("jpg");
-            let file_name = format!("{}_{}_{}.{}", b.author_handle, b.id, idx + 1, ext);
-            let dest_path = media_dir.join(&file_name);
-
-            if !dest_path.exists()
-                && let Ok(resp) = client.get(media_url).send().await
-                && let Ok(bytes) = resp.bytes().await
-            {
-                let _ = fs::write(&dest_path, bytes);
-            }
-
-            if dest_path.exists() {
-                downloaded += 1;
-                let rel_path = format!("./media/{file_name}");
-                if !b.local_media.contains(&rel_path) {
-                    b.local_media.push(rel_path);
-                }
-            }
-        }
-    }
-
-    spinner.finish_and_clear();
-    ui::success(format!(
-        "downloaded {downloaded} media images to {}",
-        ui::style_bold(&media_dir.display().to_string())
-    ));
-    Ok(())
-}
-
-fn write_output(bookmarks: &[TweetBookmark], path: &Path, format: OutputFormat) -> Result<()> {
-    match format {
-        OutputFormat::Markdown => {
-            let mut content = String::new();
-            content.push_str("# X (Twitter) Bookmarks\n\n");
-            content.push_str(&format!("Total: {} bookmarks\n\n", bookmarks.len()));
-            content.push_str("| Type | Author | Tweet | Media / Links |\n");
-            content.push_str("| --- | --- | --- | --- |\n");
-            for b in bookmarks {
-                let clean_text = b.text.replace('\n', " ").replace('|', "\\|");
-                let mut media_links = Vec::new();
-
-                if !b.local_media.is_empty() {
-                    for m in &b.local_media {
-                        media_links.push(format!("[![Img]({m})]({m})"));
-                    }
-                } else {
-                    for m in &b.media {
-                        media_links.push(format!("[![Img]({m})]({m})"));
+    fn tweet_fixture(extra: serde_json::Value) -> serde_json::Value {
+        let mut tweet = json!({
+            "__typename": "Tweet",
+            "rest_id": "123456789",
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": {
+                            "screen_name": "alice",
+                            "name": "Alice"
+                        }
                     }
                 }
-
-                let media_col = if media_links.is_empty() {
-                    format!("[View Status]({})", b.url)
-                } else {
-                    format!("[View Status]({})<br/>🖼️ {}", b.url, media_links.join(" "))
-                };
-
-                content.push_str(&format!(
-                    "| `{}` | {} (@{}) | {} | {} |\n",
-                    b.tweet_type, b.author_name, b.author_handle, clean_text, media_col
-                ));
+            },
+            "legacy": {
+                "full_text": "Original post",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018"
             }
-            fs::write(path, content).context("failed to write Markdown output")?;
-        }
-        OutputFormat::Urls => {
-            let mut content = String::new();
-            for b in bookmarks {
-                content.push_str(&format!("[{}] {}\n", b.tweet_type, b.url));
-                for m in &b.media {
-                    content.push_str(&format!("  └─ {}\n", m));
-                }
-            }
-            fs::write(path, content).context("failed to write URLs output")?;
-        }
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(bookmarks)
-                .context("failed to serialize JSON output")?;
-            fs::write(path, json).context("failed to write JSON output")?;
+        });
+
+        let tweet_object = tweet.as_object_mut().expect("tweet fixture is an object");
+        let serde_json::Value::Object(extra_object) = extra else {
+            panic!("extra fixture is an object");
+        };
+        tweet_object.extend(extra_object);
+        tweet
+    }
+
+    fn bookmark_fixture(id: &str) -> TweetBookmark {
+        TweetBookmark {
+            id: id.to_string(),
+            content_type: ContentType::Article,
+            subtypes: vec![ContentSubtype::Quoted, ContentSubtype::Video],
+            author_name: "RainbowBird | 洛灵".to_string(),
+            author_handle: "alice".to_string(),
+            text: "https://t.co/ac3XPxNKAb".to_string(),
+            created_at: "Wed Oct 10 20:19:24 +0000 2018".to_string(),
+            url: format!("https://x.com/alice/status/{id}"),
+            links: vec![LinkPreview {
+                title: Some(format!("Article {id}")),
+                url: "https://t.co/ac3XPxNKAb".to_string(),
+                expanded_url: Some(format!("https://x.com/i/article/{id}")),
+            }],
+            metrics: TweetMetrics {
+                bookmarks: Some(10),
+                likes: Some(20),
+                replies: Some(30),
+                views: Some(40),
+                reposts: Some(50),
+                quotes: Some(60),
+            },
+            media: Vec::new(),
+            local_media: Vec::new(),
         }
     }
-    Ok(())
+
+    fn temporary_path(extension: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "clix-x-bookmarks-{}-{unique}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn extraction_uses_content_type_and_non_exclusive_subtypes() {
+        let article = extract_tweet(&tweet_fixture(json!({
+            "article": {"article_results": {"result": {}}},
+            "quoted_status_result": {"result": {"rest_id": "987654321"}},
+            "card": {"legacy": {"name": "poll2choice_text_only"}},
+            "legacy": {
+                "full_text": "Article with several subtypes",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+                "is_quote_status": true,
+                "in_reply_to_status_id_str": "987654321",
+                "extended_entities": {
+                    "media": [
+                        {
+                            "type": "photo",
+                            "media_url_https": "https://pbs.twimg.com/media/photo.jpg"
+                        },
+                        {
+                            "type": "video",
+                            "media_url_https": "https://pbs.twimg.com/media/video.jpg"
+                        },
+                        {
+                            "type": "animated_gif",
+                            "media_url_https": "https://pbs.twimg.com/media/gif.jpg"
+                        }
+                    ]
+                }
+            }
+        })))
+        .expect("article should be extracted");
+        assert_eq!(article.content_type, ContentType::Article);
+        assert_eq!(
+            article.subtypes,
+            vec![
+                ContentSubtype::Quoted,
+                ContentSubtype::RepliedTo,
+                ContentSubtype::Photo,
+                ContentSubtype::Video,
+                ContentSubtype::AnimatedGif,
+                ContentSubtype::Poll,
+            ]
+        );
+
+        let note_tweet = extract_tweet(&tweet_fixture(json!({
+            "note_tweet": {"note_tweet_results": {"result": {"text": "Long post"}}}
+        })))
+        .expect("note tweet should be extracted");
+        assert_eq!(note_tweet.content_type, ContentType::NoteTweet);
+
+        let post =
+            extract_tweet(&tweet_fixture(json!({}))).expect("plain tweet should be extracted");
+        assert_eq!(post.content_type, ContentType::Post);
+        assert!(post.subtypes.is_empty());
+    }
+
+    #[test]
+    fn extraction_collects_available_engagement_metrics() {
+        let bookmark = extract_tweet(&tweet_fixture(json!({
+            "views": {"count": "600"},
+            "legacy": {
+                "full_text": "Measured post",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+                "bookmark_count": 100,
+                "favorite_count": 200,
+                "reply_count": 300,
+                "retweet_count": 400,
+                "quote_count": 500
+            }
+        })))
+        .expect("measured post should be extracted");
+
+        assert_eq!(
+            bookmark.metrics,
+            TweetMetrics {
+                bookmarks: Some(100),
+                likes: Some(200),
+                replies: Some(300),
+                views: Some(600),
+                reposts: Some(400),
+                quotes: Some(500),
+            }
+        );
+    }
+
+    #[test]
+    fn extraction_builds_an_article_title_link_from_the_short_url() {
+        let bookmark = extract_tweet(&tweet_fixture(json!({
+            "article": {
+                "article_results": {
+                    "result": {
+                        "title": "A useful long post"
+                    }
+                }
+            },
+            "legacy": {
+                "full_text": "https://t.co/ac3XPxNKAb",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018",
+                "entities": {
+                    "urls": [{
+                        "url": "https://t.co/ac3XPxNKAb",
+                        "expanded_url": "https://x.com/i/article/2078674233731985408"
+                    }]
+                }
+            }
+        })))
+        .expect("article should be extracted");
+
+        assert_eq!(bookmark.content_type, ContentType::Article);
+        assert_eq!(
+            bookmark.links,
+            vec![LinkPreview {
+                title: Some("A useful long post".to_string()),
+                url: "https://t.co/ac3XPxNKAb".to_string(),
+                expanded_url: Some("https://x.com/i/article/2078674233731985408".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn expanded_x_article_url_classifies_a_post_even_without_a_title() {
+        let bookmark = extract_tweet(&tweet_fixture(json!({
+            "legacy": {
+                "full_text": "https://t.co/inS2sFFa5b",
+                "created_at": "Tue Jul 14 03:03:13 +0000 2026",
+                "entities": {
+                    "urls": [{
+                        "url": "https://t.co/inS2sFFa5b",
+                        "expanded_url": "http://x.com/i/article/2076861011957800960"
+                    }]
+                }
+            }
+        })))
+        .expect("article seed post should be extracted");
+
+        assert_eq!(bookmark.content_type, ContentType::Article);
+        assert_eq!(
+            bookmark.links,
+            vec![LinkPreview {
+                title: None,
+                url: "https://t.co/inS2sFFa5b".to_string(),
+                expanded_url: Some("https://x.com/i/article/2076861011957800960".to_string()),
+            }]
+        );
+    }
+
+    #[test]
+    fn note_tweet_entities_are_preserved_in_media_links() {
+        let bookmark = extract_tweet(&tweet_fixture(json!({
+            "note_tweet": {
+                "note_tweet_results": {
+                    "result": {
+                        "text": "Read https://t.co/note后续",
+                        "entity_set": {
+                            "urls": [{
+                                "url": "https://t.co/note",
+                                "expanded_url": "https://example.com/note"
+                            }]
+                        }
+                    }
+                }
+            }
+        })))
+        .expect("NoteTweet should be extracted");
+
+        assert_eq!(bookmark.content_type, ContentType::NoteTweet);
+        assert_eq!(bookmark.links.len(), 1);
+        assert_eq!(
+            bookmark.links[0].expanded_url.as_deref(),
+            Some("https://example.com/note")
+        );
+        assert_eq!(format_tweet_cell(&bookmark, false), "Read 后续");
+
+        let output = render_output(&[bookmark], OutputFormat::Markdown, false)
+            .expect("Markdown should render");
+        assert!(output.contains("[Open Link](https://example.com/note)"));
+    }
+
+    #[test]
+    fn null_timeline_is_not_accepted_as_a_successful_response() {
+        assert!(!has_bookmark_timeline(&json!({
+            "data": {"bookmark_timeline_v2": {"timeline": {"instructions": null}}}
+        })));
+        assert!(has_bookmark_timeline(&json!({
+            "data": {"bookmark_timeline_v2": {"timeline": {"instructions": []}}}
+        })));
+    }
+
+    #[test]
+    fn bookmark_timeline_modules_and_bottom_cursors_are_parsed() {
+        let response = json!({
+            "data": {
+                "bookmark_timeline_v2": {
+                    "timeline": {
+                        "instructions": [{
+                            "entries": [
+                                {
+                                    "entryId": "module-1",
+                                    "content": {
+                                        "items": [{
+                                            "item": {
+                                                "itemContent": {
+                                                    "tweet_results": {
+                                                        "result": tweet_fixture(json!({}))
+                                                    }
+                                                }
+                                            }
+                                        }]
+                                    }
+                                },
+                                {
+                                    "entryId": "cursor-bottom-1",
+                                    "content": {
+                                        "cursorType": "Bottom",
+                                        "value": "next-page"
+                                    }
+                                }
+                            ]
+                        }]
+                    }
+                }
+            }
+        });
+
+        let (tweets, cursor) = parse_bookmarks_response(&response);
+        assert_eq!(tweets.len(), 1);
+        assert_eq!(tweets[0].id, "123456789");
+        assert_eq!(cursor.as_deref(), Some("next-page"));
+    }
+
+    #[test]
+    fn article_tweet_cell_has_plain_title_or_placeholder_without_links() {
+        let mut bookmark = bookmark_fixture("2078674233731985408");
+        bookmark.links[0].title =
+            Some("Article 2078674233731985408 https://example.com/source".to_string());
+        let titled = format_tweet_cell(&bookmark, false);
+        let link_only = format_tweet_cell(&bookmark, true);
+
+        assert_eq!(titled, "Article 2078674233731985408");
+        assert!(!titled.contains("https://"));
+        assert!(!titled.contains("t.co"));
+        assert!(!titled.contains("]("));
+        assert_eq!(link_only, "-");
+    }
+
+    #[test]
+    fn tweet_cell_removes_all_urls_but_preserves_article_commentary() {
+        let mut bookmark = bookmark_fixture("2078674233731985408");
+        bookmark.text =
+            "My commentary https://t.co/ac3XPxNKAb and https://t.co/media123".to_string();
+        bookmark.links.push(LinkPreview {
+            title: Some("Second link".to_string()),
+            url: "https://t.co/second".to_string(),
+            expanded_url: Some("https://example.com/second".to_string()),
+        });
+
+        assert_eq!(
+            format_tweet_cell(&bookmark, false),
+            "Article 2078674233731985408<br/>My commentary and"
+        );
+        assert_eq!(format_tweet_cell(&bookmark, true), "My commentary and");
+
+        let output = render_output(&[bookmark], OutputFormat::Markdown, false)
+            .expect("Markdown should render");
+        assert!(!output.contains("t.co"));
+        assert!(output.contains(
+            "[Article 2078674233731985408](https://x.com/i/article/2078674233731985408)"
+        ));
+        assert!(output.contains("[Open Link](https://example.com/second)"));
+    }
+
+    #[test]
+    fn tweet_cell_deactivates_markdown_and_preserves_text_after_urls() {
+        let mut bookmark = bookmark_fixture("2078674233731985408");
+        bookmark.links[0].title = None;
+        bookmark.text =
+            "See [local docs](guide.md), HTTPS://t.co/path后续 and www.example.com.".to_string();
+
+        assert_eq!(
+            format_tweet_cell(&bookmark, false),
+            "See local docs, 后续 and."
+        );
+    }
+
+    #[test]
+    fn partial_media_downloads_keep_remote_fallbacks() {
+        let mut bookmark = bookmark_fixture("100");
+        bookmark.media = vec![
+            "https://pbs.twimg.com/media/first.jpg".into(),
+            "https://pbs.twimg.com/media/second.png".into(),
+        ];
+        bookmark.local_media = vec!["./media/alice_100_2.png".into()];
+        bookmark.links.push(LinkPreview {
+            title: None,
+            url: "https://t.co/special".into(),
+            expanded_url: Some("https://example.com/a_(b)".into()),
+        });
+
+        let output = render_output(&[bookmark], OutputFormat::Markdown, false)
+            .expect("Markdown should render");
+        assert!(output.contains("https://pbs.twimg.com/media/first.jpg"));
+        assert!(output.contains("./media/alice_100_2.png"));
+        assert!(!output.contains("https://pbs.twimg.com/media/second.png"));
+        assert!(output.contains("https://example.com/a_%28b%29"));
+    }
+
+    #[test]
+    fn referenced_status_links_do_not_pollute_incremental_ids_or_total() {
+        let mut bookmark = bookmark_fixture("100");
+        bookmark.links.push(LinkPreview {
+            title: None,
+            url: "https://t.co/reference".to_string(),
+            expanded_url: Some("https://x.com/other/status/999".to_string()),
+        });
+        let output = render_output(&[bookmark], OutputFormat::Markdown, false)
+            .expect("Markdown should render");
+
+        let (ids, row_count) = markdown_status_ids_and_count(&output);
+        assert_eq!(ids, HashSet::from(["100".to_string()]));
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn output_and_state_paths_must_be_distinct() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let output = directory.path().join("bookmarks.json");
+
+        assert!(ensure_distinct_paths(&output, &output).is_err());
+        assert_ne!(default_state_path(&output), output);
+
+        let state_named_output = directory.path().join("bookmarks.state.json");
+        assert_ne!(
+            default_state_path(&state_named_output),
+            state_named_output,
+            "the default state path must never overwrite the output"
+        );
+    }
+
+    #[test]
+    fn markdown_contains_types_original_time_and_metrics() {
+        let bookmark = bookmark_fixture("123456789");
+        let path = temporary_path("md");
+        let json = serde_json::to_value(&bookmark).expect("bookmark should serialize");
+
+        write_output(&[bookmark], &path, OutputFormat::Markdown, false)
+            .expect("Markdown output should be written");
+        let output = std::fs::read_to_string(&path).expect("Markdown output should be readable");
+        std::fs::remove_file(path).expect("temporary Markdown output should be removable");
+
+        assert!(output.contains(
+            "| Content Type | Subtypes | Author | Published At | Tweet | Media / Links | Bookmarks | Likes | Replies | Views | Reposts | Quotes |"
+        ));
+        assert!(output.contains("| `article` | `quoted`, `video` |"));
+        assert!(output.contains("RainbowBird \\| 洛灵 (@alice)"));
+        assert!(output.contains("`2018-10-10 20:19:24`"));
+        assert!(output.contains("| Article 123456789 |"));
+        assert!(output.contains("[Article 123456789](https://x.com/i/article/123456789)"));
+        assert!(!output.contains("[https://t.co/ac3XPxNKAb]"));
+        assert!(output.contains("| 10 | 20 | 30 | 40 | 50 | 60 |"));
+        assert_eq!(json["content_type"], "article");
+        assert_eq!(json["subtypes"], json!(["quoted", "video"]));
+    }
+
+    #[test]
+    fn incremental_markdown_prepends_new_rows_updates_total_and_deduplicates() {
+        let old = bookmark_fixture("100");
+        let new = bookmark_fixture("200");
+        let path = temporary_path("md");
+        write_output(
+            std::slice::from_ref(&old),
+            &path,
+            OutputFormat::Markdown,
+            false,
+        )
+        .expect("baseline should be written");
+
+        let existing =
+            ExistingOutput::load(&path, OutputFormat::Markdown).expect("baseline should load");
+        let known = HashSet::from([old.id]);
+        append_output(
+            std::slice::from_ref(&new),
+            &path,
+            OutputFormat::Markdown,
+            false,
+            &known,
+            Some(&existing),
+        )
+        .expect("new row should be appended");
+        let existing =
+            ExistingOutput::load(&path, OutputFormat::Markdown).expect("merged output should load");
+        append_output(
+            std::slice::from_ref(&new),
+            &path,
+            OutputFormat::Markdown,
+            false,
+            &HashSet::new(),
+            Some(&existing),
+        )
+        .expect("repeated row should be ignored");
+
+        let output = std::fs::read_to_string(&path).expect("merged output should be readable");
+        std::fs::remove_file(path).expect("temporary output should be removable");
+        assert!(output.contains("Total: 2 bookmarks"));
+        assert!(
+            output.find("/status/200").expect("new row exists")
+                < output.find("/status/100").expect("old row exists")
+        );
+        assert_eq!(output.matches("/status/200").count(), 1);
+        assert_eq!(
+            markdown_status_ids_and_count(&output).0,
+            HashSet::from(["100".into(), "200".into()])
+        );
+    }
+
+    #[test]
+    fn incremental_markdown_migrates_legacy_tweet_links_without_new_rows() {
+        let bookmark = bookmark_fixture("100");
+        let path = temporary_path("md");
+        write_output(
+            std::slice::from_ref(&bookmark),
+            &path,
+            OutputFormat::Markdown,
+            false,
+        )
+        .expect("baseline should be written");
+
+        let legacy = std::fs::read_to_string(&path)
+            .expect("baseline should be readable")
+            .replace(
+                "| Article 100 |",
+                "| [Article 100](https://x.com/i/article/100) https://t.co/old后续 |",
+            );
+        std::fs::write(&path, legacy).expect("legacy fixture should be written");
+
+        let existing =
+            ExistingOutput::load(&path, OutputFormat::Markdown).expect("legacy output should load");
+        append_output(
+            &[],
+            &path,
+            OutputFormat::Markdown,
+            false,
+            &HashSet::from(["100".to_string()]),
+            Some(&existing),
+        )
+        .expect("legacy rows should be migrated");
+
+        let migrated = std::fs::read_to_string(&path).expect("migrated output should be readable");
+        let row = migrated
+            .lines()
+            .find(|line| line.contains("[View Status]"))
+            .expect("bookmark row should remain");
+        let cells = row.split(" | ").collect::<Vec<_>>();
+        assert_eq!(cells[4], "Article 100 后续");
+        assert!(!cells[4].contains("]("));
+        assert!(!cells[4].contains("http"));
+
+        let loaded = ExistingOutput::load(&path, OutputFormat::Markdown)
+            .expect("migrated output should load");
+        append_output(
+            &[],
+            &path,
+            OutputFormat::Markdown,
+            false,
+            &HashSet::from(["100".to_string()]),
+            Some(&loaded),
+        )
+        .expect("migration should be idempotent");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("output should remain readable"),
+            migrated
+        );
+        std::fs::remove_file(path).expect("temporary output should be removable");
+    }
+
+    #[test]
+    fn existing_export_bootstraps_state_and_state_round_trips() {
+        let bookmark = bookmark_fixture("2076865068613206046");
+        let output_path = temporary_path("md");
+        let state_path = temporary_path("state.json");
+        write_output(
+            std::slice::from_ref(&bookmark),
+            &output_path,
+            OutputFormat::Markdown,
+            false,
+        )
+        .expect("baseline should be written");
+
+        let existing =
+            ExistingOutput::load(&output_path, OutputFormat::Markdown).expect("output should load");
+        let output_ids = existing.ids().clone();
+        assert_eq!(output_ids, HashSet::from([bookmark.id]));
+        assert_eq!(
+            existing.article_titles(),
+            BTreeMap::from([(
+                "2076865068613206046".to_string(),
+                "Article 2076865068613206046".to_string()
+            )])
+        );
+
+        let titles = existing.article_titles();
+        write_state(
+            &state_path,
+            &BookmarkState::new(output_ids.clone(), titles.clone()),
+        )
+        .expect("state should be written");
+        let (loaded_ids, loaded_titles) =
+            load_state_cache(&state_path).expect("state cache should load");
+        assert_eq!(loaded_ids, output_ids);
+        assert_eq!(loaded_titles, titles);
+        std::fs::remove_file(output_path).expect("temporary output should be removable");
+        std::fs::remove_file(state_path).expect("temporary state should be removable");
+    }
+
+    #[test]
+    fn generic_article_link_does_not_cache_commentary_as_a_title() {
+        let mut bookmark = bookmark_fixture("2076865068613206046");
+        bookmark.text = "Author commentary".to_string();
+        let output_path = temporary_path("md");
+        write_output(
+            std::slice::from_ref(&bookmark),
+            &output_path,
+            OutputFormat::Markdown,
+            true,
+        )
+        .expect("link-only output should be written");
+
+        let existing =
+            ExistingOutput::load(&output_path, OutputFormat::Markdown).expect("output should load");
+        assert!(existing.article_titles().is_empty());
+        std::fs::remove_file(output_path).expect("temporary output should be removable");
+    }
+
+    #[test]
+    fn ordinary_external_preview_is_not_an_article_cache_target() {
+        let mut bookmark = bookmark_fixture("2076865068613206046");
+        bookmark.content_type = ContentType::Post;
+        bookmark.links[0].expanded_url = Some("https://example.com/story".to_string());
+
+        assert_eq!(article_link_index(&bookmark), None);
+    }
+
+    #[test]
+    fn state_title_takes_precedence_over_the_rendered_title() {
+        let bookmark = bookmark_fixture("2076865068613206046");
+        let output_path = temporary_path("md");
+        let state_path = temporary_path("state.json");
+        write_output(
+            std::slice::from_ref(&bookmark),
+            &output_path,
+            OutputFormat::Markdown,
+            false,
+        )
+        .expect("output should be written");
+        write_state(
+            &state_path,
+            &BookmarkState::new(
+                HashSet::from([bookmark.id.clone()]),
+                BTreeMap::from([(bookmark.id.clone(), "Fresh API title".to_string())]),
+            ),
+        )
+        .expect("state should be written");
+
+        let previous =
+            load_previous_export(&output_path, &state_path, OutputFormat::Markdown, true)
+                .expect("previous export should load");
+        assert_eq!(
+            previous
+                .article_titles
+                .get(&bookmark.id)
+                .map(String::as_str),
+            Some("Fresh API title")
+        );
+        std::fs::remove_file(output_path).expect("temporary output should be removable");
+        std::fs::remove_file(state_path).expect("temporary state should be removable");
+    }
+
+    #[test]
+    fn incremental_boundary_requires_a_full_known_page() {
+        let known = HashSet::from(["100".to_string(), "200".to_string()]);
+        let fully_known = vec![bookmark_fixture("100"), bookmark_fixture("200")];
+        let mixed = vec![bookmark_fixture("200"), bookmark_fixture("300")];
+
+        assert!(page_is_known_boundary(&fully_known, true, &known));
+        assert!(!page_is_known_boundary(&mixed, true, &known));
+        assert!(!page_is_known_boundary(&fully_known, false, &known));
+        assert!(!page_is_known_boundary(&[], true, &known));
+    }
+
+    #[test]
+    fn export_lock_rejects_concurrent_updates_and_releases_on_drop() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let output = directory.path().join("bookmarks.md");
+        let state = directory.path().join("bookmarks.state.json");
+
+        let first =
+            acquire_export_locks(&output, &state).expect("first export should acquire its locks");
+        assert!(
+            acquire_export_locks(&output, &state).is_err(),
+            "a concurrent exporter must not read and overwrite stale state"
+        );
+        drop(first);
+        acquire_export_locks(&output, &state)
+            .expect("locks should be released when the exporter exits");
+    }
 }

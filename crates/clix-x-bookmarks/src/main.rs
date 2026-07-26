@@ -14,11 +14,8 @@ struct StandaloneCli {
     args: BookmarksArgs,
 }
 
-#[tokio::main]
-async fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> std::process::ExitCode {
     let cli = StandaloneCli::parse();
-    if let Err(err) = clix_x_bookmarks::run(cli.args).await {
-        ui::error(&err);
-        std::process::exit(1);
-    }
+    ui::exit_code(clix_x_bookmarks::run(cli.args).await)
 }
