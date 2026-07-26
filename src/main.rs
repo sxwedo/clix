@@ -33,8 +33,11 @@ enum Commands {
         #[command(subcommand)]
         command: XCommands,
     },
-    /// View a Markdown or MDX file in the terminal
-    View(ViewArgs),
+    /// Markdown and MDX tools
+    Md {
+        #[command(subcommand)]
+        command: MdCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -49,6 +52,12 @@ enum XCommands {
     Bookmarks(BookmarksArgs),
     /// Download and convert a single X status URL/ID into a local Markdown/MDX file
     Read(ReadArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum MdCommands {
+    /// View a Markdown or MDX file in the terminal
+    View(ViewArgs),
 }
 
 fn main() -> std::process::ExitCode {
@@ -69,7 +78,9 @@ fn run(cli: Cli) -> Result<()> {
                 XCommands::Read(args) => clix_x_read::run(args).await,
             }
         }),
-        Commands::View(args) => clix_view::run(args),
+        Commands::Md { command } => match command {
+            MdCommands::View(args) => clix_view::run(args),
+        },
     }
 }
 
@@ -85,7 +96,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use clix_gh_stars::OutputFormat;
 
-    use super::{Cli, Commands, GhCommands};
+    use super::{Cli, Commands, GhCommands, MdCommands};
 
     #[test]
     fn command_tree_is_internally_consistent() {
@@ -113,6 +124,19 @@ mod tests {
             } if args.username.as_deref() == Some("octocat")
                 && args.format == OutputFormat::Json
                 && args.output.as_deref() == Some(std::path::Path::new("stars.json"))
+        ));
+    }
+
+    #[test]
+    fn parses_the_documented_markdown_view_invocation() {
+        let cli = Cli::try_parse_from(["clix", "md", "view", "article.md"])
+            .expect("documented Markdown view arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Md {
+                command: MdCommands::View(args)
+            } if args.path == std::path::Path::new("article.md")
         ));
     }
 }

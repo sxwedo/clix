@@ -37,7 +37,7 @@ pub struct ReadArgs {
     #[arg(long)]
     pub ct0: Option<String>,
 
-    /// Output path (default: `<author_handle>_<title>.md`)
+    /// Output path (default: `<author_handle>:<title>.md`)
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
@@ -92,12 +92,7 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let title = detail.article_title.clone().unwrap_or_else(|| {
         markdown_text_to_plain(detail.text.lines().next().unwrap_or(&detail.id))
     });
-    let default_file_name = format!(
-        "{}_{}.{}",
-        detail.author_handle,
-        sanitize_filename(&title),
-        extension
-    );
+    let default_file_name = default_output_file_name(&detail.author_handle, &title, extension);
     let output_path = resolve_output_path(args.output, default_file_name)?;
 
     if !args.no_media && !detail.media_urls.is_empty() {
@@ -144,6 +139,10 @@ fn resolve_output_path(output: Option<PathBuf>, default_file_name: String) -> Re
     } else {
         Ok(output)
     }
+}
+
+fn default_output_file_name(author_handle: &str, title: &str, extension: &str) -> String {
+    format!("{author_handle}:{}.{}", sanitize_filename(title), extension)
 }
 
 fn extract_tweet_id(input: &str) -> Result<String> {
@@ -696,8 +695,8 @@ mod tests {
     use clix_x_api::{ContentType, TweetType};
 
     use super::{
-        ReadOutputFormat, TweetDetail, extract_tweet_id, markdown_text_to_plain, render_markdown,
-        render_mdx, sanitize_filename, write_tweet_file,
+        ReadOutputFormat, TweetDetail, default_output_file_name, extract_tweet_id,
+        markdown_text_to_plain, render_markdown, render_mdx, sanitize_filename, write_tweet_file,
     };
 
     #[test]
@@ -749,6 +748,10 @@ mod tests {
     fn filename_formatting_is_bounded_and_stable() {
         assert_eq!(sanitize_filename("  hello / 世界  "), "hello_世界");
         assert_eq!(sanitize_filename("***"), "post");
+        assert_eq!(
+            default_output_file_name("raft_hq", "Don't talk to me, talk to my agents", "md"),
+            "raft_hq:Don_t_talk_to_me_talk_to_my_agents.md"
+        );
         assert_eq!(
             markdown_text_to_plain(r"Cost \$100 for GPT\-5\.6 &lt;today&gt;"),
             "Cost $100 for GPT-5.6 <today>"

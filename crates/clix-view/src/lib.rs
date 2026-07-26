@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{self, IsTerminal},
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -36,15 +37,28 @@ pub fn run(args: ViewArgs) -> Result<()> {
     Ok(())
 }
 
-fn print_terminal_image(image_path: &Path) {
-    let config = viuer::Config {
+fn native_image_protocol_available() -> bool {
+    io::stdout().is_terminal()
+        && (viuer::is_iterm_supported() || viuer::get_kitty_support() != viuer::KittySupport::None)
+}
+
+fn terminal_image_config(terminal_width: u16) -> viuer::Config {
+    let available_width = terminal_width.saturating_sub(2);
+
+    viuer::Config {
         transparent: false,
         absolute_offset: false,
-        width: Some(60),
-        height: Some(25),
+        width: (available_width > 0).then_some(u32::from(available_width)),
+        // Supplying only the width makes viuer preserve the image's aspect ratio.
+        height: None,
         restore_cursor: false,
         ..Default::default()
-    };
+    }
+}
+
+fn print_terminal_image(image_path: &Path) {
+    let (terminal_width, _) = viuer::terminal_size();
+    let config = terminal_image_config(terminal_width);
 
     println!();
     if let Err(error) = viuer::print_from_file(image_path, &config) {
@@ -59,6 +73,7 @@ fn print_terminal_image(image_path: &Path) {
 fn render_markdown_in_terminal(content: &str, base_dir: &Path) {
     println!();
     let mut in_frontmatter = false;
+    let render_local_images = native_image_protocol_available();
 
     for (line_index, line) in content.lines().enumerate() {
         if line_index == 0 && line.trim() == "---" {
@@ -84,7 +99,7 @@ fn render_markdown_in_terminal(content: &str, base_dir: &Path) {
             } else {
                 base_dir.join(image.path)
             };
-            if resolved_path.exists() {
+            if resolved_path.exists() && render_local_images {
                 if has_surrounding_text {
                     println!("{line}");
                 }
@@ -230,7 +245,7 @@ const fn hex_value(value: u8) -> Option<u8> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::markdown_image;
+    use super::{markdown_image, terminal_image_config};
 
     #[test]
     fn extracts_inline_titled_and_encoded_markdown_image_paths() {
@@ -248,5 +263,13 @@ mod tests {
             None
         );
         assert_eq!(markdown_image("![broken]()"), None);
+    }
+
+    #[test]
+    fn terminal_image_config_preserves_aspect_ratio_and_uses_available_width() {
+        let config = terminal_image_config(80);
+
+        assert_eq!(config.width, Some(78));
+        assert_eq!(config.height, None);
     }
 }

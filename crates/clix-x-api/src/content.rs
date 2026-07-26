@@ -383,19 +383,85 @@ fn utf16_offset_to_byte(value: &str, target: usize) -> Option<usize> {
 
 fn escape_markdown_text(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '{' | '}' => escaped.push(character),
-            character if character.is_ascii_punctuation() => {
+
+    for line in value.split_inclusive('\n') {
+        let (body, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        let block_marker = markdown_block_marker(body);
+
+        for (index, character) in body.char_indices() {
+            if block_marker == Some(index) {
                 escaped.push('\\');
-                escaped.push(character);
             }
-            _ => escaped.push(character),
+            match character {
+                '\\' => escaped.push_str("\\\\"),
+                '`' | '*' | '_' | '[' | ']' | '~' | '|' => {
+                    escaped.push('\\');
+                    escaped.push(character);
+                }
+                '<' => escaped.push_str("&lt;"),
+                '>' => escaped.push_str("&gt;"),
+                _ => escaped.push(character),
+            }
+        }
+        escaped.push_str(newline);
+    }
+
+    escaped
+}
+
+fn markdown_block_marker(line: &str) -> Option<usize> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+
+    let rest = &line[indent..];
+    let bytes = rest.as_bytes();
+    let marker_has_whitespace_after =
+        |marker_end: usize| bytes.get(marker_end).is_some_and(u8::is_ascii_whitespace);
+
+    let hash_count = bytes.iter().take_while(|byte| **byte == b'#').count();
+    if (1..=6).contains(&hash_count)
+        && (hash_count == bytes.len() || marker_has_whitespace_after(hash_count))
+    {
+        return Some(indent);
+    }
+
+    if matches!(bytes.first(), Some(b'-' | b'+')) && marker_has_whitespace_after(1) {
+        return Some(indent);
+    }
+
+    let digit_count = bytes
+        .iter()
+        .take(9)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digit_count > 0
+        && matches!(bytes.get(digit_count), Some(b'.' | b')'))
+        && marker_has_whitespace_after(digit_count + 1)
+    {
+        return Some(indent + digit_count);
+    }
+
+    if is_markdown_rule(rest, b'-') || is_markdown_rule(rest, b'=') {
+        return Some(indent);
+    }
+
+    None
+}
+
+fn is_markdown_rule(value: &str, marker: u8) -> bool {
+    let mut marker_count = 0;
+    for byte in value.trim_end_matches('\r').bytes() {
+        if byte == marker {
+            marker_count += 1;
+        } else if !matches!(byte, b' ' | b'\t') {
+            return false;
         }
     }
-    escaped
+    marker_count >= if marker == b'-' { 3 } else { 1 }
 }
 
 fn code_span_delimiter(text: &str) -> String {
@@ -886,9 +952,45 @@ mod tests {
         assert_eq!(
             render_content_state(&content_state, &HashMap::new()).as_deref(),
             Some(
-                "&lt;u&gt;literal&lt;\\/u&gt;\n\n\
+                "&lt;u&gt;literal&lt;/u&gt;\n\n\
                  <u>safe</u>\n\n`` a`b ``\n\n`` `foo` ``\n\n\
                  ````\nconst tag = `<Tag>`; ```\n````"
+            )
+        );
+    }
+
+    #[test]
+    fn prose_punctuation_is_not_overescaped() {
+        let content_state = json!({
+            "blocks": [{
+                "type": "unstyled",
+                "text": "But the safety is the floor, not the point. Raft's cross-company answer: talk to @team!"
+            }]
+        });
+
+        assert_eq!(
+            render_content_state(&content_state, &HashMap::new()).as_deref(),
+            Some(
+                "But the safety is the floor, not the point. \
+                 Raft's cross-company answer: talk to @team!"
+            )
+        );
+    }
+
+    #[test]
+    fn markdown_block_markers_and_inline_syntax_are_still_neutralized() {
+        let content_state = json!({
+            "blocks": [{
+                "type": "unstyled",
+                "text": "# heading\n- item\n1. ordered\n---\n===\n#hashtag and *literal* [text]"
+            }]
+        });
+
+        assert_eq!(
+            render_content_state(&content_state, &HashMap::new()).as_deref(),
+            Some(
+                "\\# heading\n\\- item\n1\\. ordered\n\\---\n\\===\n\
+                 #hashtag and \\*literal\\* \\[text\\]"
             )
         );
     }
@@ -925,9 +1027,9 @@ mod tests {
                 .expect("content state should render"),
         ] {
             assert!(!rendered.contains("![track]("));
-            assert!(!rendered.contains("](javascript:"));
+            assert!(!rendered.contains("[x](javascript:"));
             assert!(!rendered.contains("data:image"));
-            assert!(rendered.contains("\\!\\[track\\]"));
+            assert!(rendered.contains("!\\[track\\]"));
         }
     }
 
@@ -995,7 +1097,7 @@ mod tests {
 
         assert_eq!(
             extract_full_text(&post, &[]),
-            "😀 [example\\.com\\/x](https://example.com/x) end"
+            "😀 [example.com/x](https://example.com/x) end"
         );
         assert_eq!(extract_media_urls(&post), ["https://img.example/note.jpg"]);
     }
@@ -1030,8 +1132,8 @@ mod tests {
         });
 
         let rendered = extract_full_text(&post, &["https://img.example/photo.jpg".to_string()]);
-        assert!(rendered.contains("[example\\.com\\/x](https://example.com/x)"));
-        assert!(!rendered.contains("t\\.co\\/m"));
+        assert!(rendered.contains("[example.com/x](https://example.com/x)"));
+        assert!(!rendered.contains("t.co/m"));
         assert!(rendered.contains("![Image](https://img.example/photo.jpg)"));
     }
 }

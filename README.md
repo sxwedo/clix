@@ -12,7 +12,7 @@
 
 `clix` is a modular, multi-binary CLI toolset written in Rust for GitHub workflows, X exports, and local Markdown viewing.
 
-The unified `clix` binary exposes `clix gh`, `clix x`, and `clix view`. Each tool also has a standalone binary.
+The unified `clix` binary exposes `clix gh`, `clix x`, and `clix md`. Each tool also has a standalone binary.
 
 ---
 
@@ -122,12 +122,15 @@ Authentication uses the same `X_AUTH_TOKEN` and `X_CT0` environment variables as
 
 ---
 
-### 🖼️ Markdown Viewer (`clix view`)
+### 🖼️ Markdown Viewer (`clix md view`)
 
-Render a local Markdown or MDX file in the terminal, including supported local images.
+Render a local Markdown or MDX file in the terminal. Local images are displayed at
+their original aspect ratio when the terminal supports the native iTerm2 or Kitty
+image protocol. Other terminals keep the Markdown image reference visible instead
+of falling back to a low-resolution character preview.
 
 ```sh
-clix view article.md
+clix md view article.md
 clix-view article.mdx
 ```
 

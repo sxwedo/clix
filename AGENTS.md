@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, modular CLI suite written in Rust designed to streamline daily developer tasks, GitHub workflows, social media tools, and system utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix x bookmarks`, `clix x read`, `clix view`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix x bookmarks`, `clix x read`, `clix md view`) or a standalone binary.
 - **Zero-Config GitHub Auth**: Detects `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`; usernames come from the authenticated `gh` account or an explicit `github.user`.
 
 ## Commands
