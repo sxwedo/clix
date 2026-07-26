@@ -1,10 +1,9 @@
 <p align="center">
-  <img width="1672" height="941" alt="20260726-224029" src="https://github.com/user-attachments/assets/f630492e-2af6-46af-9d18-7507dc26a902" />
+  <img width="480" alt="clix logo" src="https://github.com/user-attachments/assets/f630492e-2af6-46af-9d18-7507dc26a902" />
+</p>
 
-  <h1 align="center">⚡ clix</h1>
-  <p align="center">
-    <strong>Blazing-Fast Developer Superpower CLI Suite written in Rust.</strong>
-  </p>
+<p align="center">
+  <strong>Blazing-Fast Developer Superpower CLI Suite written in Rust.</strong>
 </p>
 
 <p align="center">
