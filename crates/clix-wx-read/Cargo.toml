@@ -1,0 +1,23 @@
+[package]
+name = "clix-wx-read"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Download and convert a WeChat Official Account article URL into a standalone Markdown/MDX file with local images."
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clix-core = { path = "../clix-core" }
+html2md.workspace = true
+regex.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
+scraper.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[dev-dependencies]
+tempfile.workspace = true

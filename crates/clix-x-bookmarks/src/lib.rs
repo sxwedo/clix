@@ -274,12 +274,14 @@ mod tests {
     }
 
     fn temporary_path(extension: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "clix-x-bookmarks-{}-{unique}.{extension}",
+            "clix-x-bookmarks-{}-{unique}-{seq}.{extension}",
             std::process::id()
         ))
     }

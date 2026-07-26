@@ -7,6 +7,7 @@ members = [
     "crates/clix-x-api",
     "crates/clix-x-bookmarks",
     "crates/clix-x-read",
+    "crates/clix-wx-read",
     ".",
 ]
 
@@ -29,6 +30,9 @@ serde_json = "1.0"
 tempfile = "3.27"
 tokio = "1.40"
 viuer = "0.7"
+html2md = "0.2"
+scraper = "0.22"
+regex = "1.11"
 
 [package]
 name = "clix"
@@ -48,4 +52,5 @@ clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-view = { path = "crates/clix-view" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }
 clix-x-read = { path = "crates/clix-x-read" }
+clix-wx-read = { path = "crates/clix-wx-read" }
 tokio = { workspace = true, features = ["rt"] }
