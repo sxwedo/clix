@@ -13,7 +13,7 @@ use clix_core::{
 };
 use clix_x_api::{XCredentials, build_media_client, markdown_destination, media_extension};
 
-pub use clix_x_api::{TweetDetail, fetch_tweet_detail};
+pub use clix_x_api::{TweetDetail, fetch_tweet_detail, fetch_tweet_detail_with_options};
 
 const MAX_CONCURRENT_MEDIA_REQUESTS: usize = 4;
 
@@ -48,6 +48,10 @@ pub struct ReadArgs {
     /// Skip downloading media images locally into `media/` folder
     #[arg(long)]
     pub no_media: bool,
+
+    /// Include author and thread replies in output
+    #[arg(long)]
+    pub include_replies: bool,
 }
 
 struct MediaJob {
@@ -81,7 +85,8 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let client = credentials.build_client()?;
     let spinner = ui::create_spinner(&format!("fetching X status {tweet_id}..."));
 
-    let mut detail = fetch_tweet_detail(&client, &tweet_id).await?;
+    let mut detail =
+        fetch_tweet_detail_with_options(&client, &tweet_id, args.include_replies).await?;
     spinner.finish_and_clear();
 
     let extension = match args.format {
@@ -95,9 +100,9 @@ pub async fn run(args: ReadArgs) -> Result<()> {
     let default_file_name = default_output_file_name(&detail.author_handle, &title, extension);
     let output_path = resolve_output_path(args.output, default_file_name)?;
 
-    if !args.no_media && !detail.media_urls.is_empty() {
+    if !args.no_media {
         let media_client = build_media_client()?;
-        download_tweet_media(&media_client, &mut detail, &output_path).await?;
+        download_all_media(&media_client, &mut detail, &output_path).await?;
     }
 
     write_tweet_file(&detail, &output_path, args.format)?;
@@ -116,9 +121,15 @@ pub async fn run(args: ReadArgs) -> Result<()> {
                 .join(", ")
         )
     };
+    let replies_info = if detail.replies.is_empty() {
+        String::new()
+    } else {
+        format!(" (with {} replies)", detail.replies.len())
+    };
     ui::success(format!(
-        "saved X {} by @{} to {}",
+        "saved X {}{} by @{} to {}",
         ui::style_bold(&classification),
+        replies_info,
         ui::style_bold(&detail.author_handle),
         ui::style_bold(&output_path.display().to_string())
     ));
@@ -173,6 +184,22 @@ fn extract_tweet_id(input: &str) -> Result<String> {
     }
 
     bail!("invalid X status URL or Tweet ID: `{input}`")
+}
+
+async fn download_all_media(
+    client: &reqwest::Client,
+    detail: &mut TweetDetail,
+    output_path: &Path,
+) -> Result<()> {
+    if !detail.media_urls.is_empty() {
+        download_tweet_media(client, detail, output_path).await?;
+    }
+    for reply in &mut detail.replies {
+        if !reply.media_urls.is_empty() {
+            download_tweet_media(client, reply, output_path).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn download_tweet_media(
@@ -367,6 +394,49 @@ fn render_markup(detail: &TweetDetail, mdx_safe: bool) -> Result<String> {
                 markdown_destination(image)
             )
             .context("failed to render attached media")?;
+        }
+    }
+
+    if !detail.replies.is_empty() {
+        content.push_str("## 💬 Replies\n\n");
+        for (index, reply) in detail.replies.iter().enumerate() {
+            let is_author = reply
+                .author_handle
+                .eq_ignore_ascii_case(&detail.author_handle);
+            let author_badge = if is_author { " (Author)" } else { "" };
+            let reply_heading = format!(
+                "### {} @{} ({}){}",
+                index + 1,
+                reply.author_handle,
+                reply.author_name,
+                author_badge
+            );
+            writeln!(content, "{reply_heading}\n").context("failed to render reply header")?;
+            writeln!(content, "*{}*\n", reply.created_at).context("failed to render reply date")?;
+
+            let reply_body = if mdx_safe {
+                Cow::Owned(sanitize_mdx(&reply.text))
+            } else {
+                Cow::Borrowed(reply.text.as_str())
+            };
+            content.push_str(&reply_body);
+            content.push_str("\n\n");
+
+            let missing_reply_media = resolved_media(reply)
+                .filter(|media| !media_is_embedded(&reply.text, media))
+                .collect::<Vec<_>>();
+            if !missing_reply_media.is_empty() {
+                for (m_idx, image) in missing_reply_media.iter().enumerate() {
+                    writeln!(
+                        content,
+                        "![Reply {} Image {}]({})\n",
+                        index + 1,
+                        m_idx + 1,
+                        markdown_destination(image)
+                    )
+                    .context("failed to render reply media")?;
+                }
+            }
         }
     }
 
@@ -732,6 +802,7 @@ mod tests {
             url: "https://x.com/alice/status/123".into(),
             media_urls: Vec::new(),
             local_media: Vec::new(),
+            replies: Vec::new(),
         };
 
         write_tweet_file(&detail, &path, ReadOutputFormat::Markdown)
@@ -780,6 +851,7 @@ mod tests {
                 "./media/alice_123_1.jpg".into(),
                 "./media/alice_123_2.png".into(),
             ],
+            replies: Vec::new(),
         };
 
         let output = render_markdown(&detail).expect("Markdown should render");
@@ -821,8 +893,8 @@ mod tests {
             url: "https://x.com/alice/status/123".into(),
             media_urls: Vec::new(),
             local_media: Vec::new(),
+            replies: Vec::new(),
         };
-
         let output = render_mdx(&detail).expect("MDX should render");
         assert!(output.contains("# 📰 &lt;script&gt;&#123;title&#125;&lt;/script&gt;"));
         assert!(output.contains("&#101;xport const value = &#123;danger&#125;"));
@@ -840,5 +912,43 @@ mod tests {
         assert!(output.contains("&lt;/u&gt;orphan-close"));
         assert!(output.contains("&lt;u&gt;&lt;u&gt;nested-orphan&lt;/u&gt;"));
         assert!(output.contains("`unclosed &lt;AfterTick /&gt; &#123;tick&#125;"));
+    }
+
+    #[test]
+    fn render_markdown_includes_replies_when_present() {
+        let detail = TweetDetail {
+            id: "123".into(),
+            content_type: ContentType::Post,
+            subtypes: Vec::new(),
+            tweet_type: TweetType::Tweet,
+            author_name: "Alice".into(),
+            author_handle: "alice".into(),
+            text: "Main post content".into(),
+            article_title: None,
+            created_at: "Wed Oct 10 20:19:24 +0000 2018".into(),
+            url: "https://x.com/alice/status/123".into(),
+            media_urls: Vec::new(),
+            local_media: Vec::new(),
+            replies: vec![TweetDetail {
+                id: "124".into(),
+                content_type: ContentType::Post,
+                subtypes: Vec::new(),
+                tweet_type: TweetType::Tweet,
+                author_name: "Alice".into(),
+                author_handle: "alice".into(),
+                text: "Self reply thread item".into(),
+                article_title: None,
+                created_at: "Wed Oct 10 20:20:24 +0000 2018".into(),
+                url: "https://x.com/alice/status/124".into(),
+                media_urls: Vec::new(),
+                local_media: Vec::new(),
+                replies: Vec::new(),
+            }],
+        };
+
+        let output = render_markdown(&detail).expect("Markdown with replies should render");
+        assert!(output.contains("## 💬 Replies"));
+        assert!(output.contains("### 1 @alice (Alice) (Author)"));
+        assert!(output.contains("Self reply thread item"));
     }
 }

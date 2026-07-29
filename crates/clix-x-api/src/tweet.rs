@@ -12,7 +12,6 @@ const TWEET_DETAIL_QUERY_IDS: &[&str] = &[
     "Lq1caG5YPcdhpTdS2ZRx7Q",
     "_NvJCnIjOW__EP5-RF197A",
     "97JF30KziU00483E_8elBA",
-    "aFvUsJm2c-oDkJV75blV6g",
 ];
 static FEATURES_JSON: OnceLock<String> = OnceLock::new();
 static FIELD_TOGGLES_JSON: OnceLock<String> = OnceLock::new();
@@ -34,6 +33,8 @@ pub struct TweetDetail {
     pub url: String,
     pub media_urls: Vec<String>,
     pub local_media: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Self>,
 }
 
 /// Fetch and parse one X post using an already-authenticated HTTP client.
@@ -51,6 +52,27 @@ pub async fn fetch_tweet_detail(client: &reqwest::Client, tweet_id: &str) -> Res
         tweet_id,
         tweet_field_toggles_json(),
         parse_tweet_detail_response,
+    )
+    .await
+}
+
+/// Fetch and parse one X post using an already-authenticated HTTP client,
+/// optionally extracting direct and threaded replies when `include_replies` is true.
+///
+/// # Errors
+///
+/// Returns an error when all known GraphQL query variants fail, X rejects the
+/// credentials or rate-limits the request, or the requested post is absent.
+pub async fn fetch_tweet_detail_with_options(
+    client: &reqwest::Client,
+    tweet_id: &str,
+    include_replies: bool,
+) -> Result<TweetDetail> {
+    fetch_tweet_with(
+        client,
+        tweet_id,
+        tweet_field_toggles_json(),
+        move |val, id| parse_tweet_detail_response_with_options(val, id, include_replies),
     )
     .await
 }
@@ -157,8 +179,9 @@ async fn fetch_tweet_with_inner<T>(
                 error_excerpt(&errors.to_string(), 500)
             ));
         } else {
+            let hint = diagnose_absent_tweet(&body, tweet_id);
             attempts.push(format!(
-                "{query_id}: target post was absent from the response"
+                "{query_id}: target post was absent from the response{hint}"
             ));
         }
     }
@@ -167,6 +190,82 @@ async fn fetch_tweet_with_inner<T>(
         "failed to fetch X status {tweet_id}: {}",
         attempts.join("; ")
     )
+}
+
+/// When we get a 200 response but `parse` returns `None`, walk the JSON tree
+/// to explain *why* the target tweet wasn't usable.  Returns a short suffix
+/// string for the error message.
+fn diagnose_absent_tweet(body: &Value, tweet_id: &str) -> String {
+    let mut found_unavailable = false;
+    let mut found_tombstone = false;
+    let mut target_node: Option<&Value> = None;
+
+    let mut pending: Vec<&Value> = vec![body];
+    while let Some(node) = pending.pop() {
+        match node {
+            Value::Object(fields) => {
+                if let Some(typename) = fields.get("__typename").and_then(Value::as_str) {
+                    if typename == "TweetUnavailable" {
+                        found_unavailable = true;
+                    } else if typename == "TweetTombstone" {
+                        found_tombstone = true;
+                    }
+                }
+                if let Some(target) = unwrap_tweet_result(node)
+                    && target
+                        .get("rest_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == tweet_id)
+                    && target_node.is_none()
+                {
+                    target_node = Some(target);
+                }
+                pending.extend(fields.values());
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+
+    if found_unavailable {
+        return " (X returned TweetUnavailable — the post may be age-gated, \
+                NSFW-restricted, or require login with a different account)"
+            .to_string();
+    }
+    if found_tombstone {
+        return " (X returned TweetTombstone — the post has been deleted)".to_string();
+    }
+    if let Some(target) = target_node {
+        let has_author = target.pointer("/core/user_results/result").is_some();
+        let has_date = target
+            .pointer("/legacy/created_at")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let has_text = target
+            .pointer("/legacy/full_text")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+            || target.get("note_tweet").is_some()
+            || target.get("article").is_some();
+        let mut missing = Vec::new();
+        if !has_author {
+            missing.push("author");
+        }
+        if !has_date {
+            missing.push("created_at");
+        }
+        if !has_text {
+            missing.push("text/full_text");
+        }
+        return format!(
+            " (rest_id {tweet_id} found but missing: {} — \
+             X likely withheld the full payload; \
+             try updating auth_token and ct0 from browser DevTools)",
+            missing.join(", ")
+        );
+    }
+
+    String::new()
 }
 
 fn tweet_variables_json(tweet_id: &str) -> String {
@@ -260,21 +359,139 @@ fn article_title_field_toggles_json() -> &'static str {
 }
 
 fn parse_tweet_detail_response(val: &Value, tweet_id: &str) -> Option<TweetDetail> {
-    let detail =
+    parse_tweet_detail_response_with_options(val, tweet_id, false)
+}
+
+fn parse_tweet_detail_response_with_options(
+    val: &Value,
+    tweet_id: &str,
+    include_replies: bool,
+) -> Option<TweetDetail> {
+    let mut detail =
         find_tweet_result(val, tweet_id).map(|target| extract_tweet_detail(target, tweet_id))?;
-    (detail.author_handle != "unknown"
+    if !(detail.author_handle != "unknown"
         && !detail.created_at.is_empty()
         && !detail.text.trim().is_empty())
-    .then_some(detail)
+    {
+        return None;
+    }
+
+    if include_replies {
+        detail.replies = extract_tweet_replies(val, tweet_id);
+    }
+
+    Some(detail)
+}
+
+fn extract_tweet_replies(val: &Value, target_id: &str) -> Vec<TweetDetail> {
+    let candidates = collect_all_tweet_candidates(val);
+    let reply_parents = candidates
+        .iter()
+        .filter_map(|target| {
+            let rest_id = target.get("rest_id").and_then(Value::as_str)?;
+            let parent_id = target
+                .pointer("/legacy/in_reply_to_status_id_str")
+                .and_then(Value::as_str)?;
+            Some((rest_id, parent_id))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut replies = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    seen_ids.insert(target_id);
+
+    for target in candidates {
+        let Some(rest_id) = target.get("rest_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen_ids.contains(rest_id) || !is_reply_descendant(rest_id, target_id, &reply_parents) {
+            continue;
+        }
+
+        let reply_detail = extract_tweet_detail(target, rest_id);
+        if reply_detail.author_handle != "unknown"
+            && !reply_detail.created_at.is_empty()
+            && !reply_detail.text.trim().is_empty()
+        {
+            seen_ids.insert(rest_id);
+            replies.push(reply_detail);
+        }
+    }
+
+    replies
+}
+
+fn is_reply_descendant(
+    candidate_id: &str,
+    target_id: &str,
+    reply_parents: &std::collections::HashMap<&str, &str>,
+) -> bool {
+    let mut current_id = candidate_id;
+    for _ in 0..reply_parents.len() {
+        let Some(parent_id) = reply_parents.get(current_id) else {
+            return false;
+        };
+        if *parent_id == target_id {
+            return true;
+        }
+        current_id = parent_id;
+    }
+    false
+}
+
+fn collect_all_tweet_candidates(value: &Value) -> Vec<&Value> {
+    let mut results = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(value);
+
+    while let Some(candidate) = queue.pop_front() {
+        if let Some(target) = unwrap_tweet_result(candidate)
+            && is_any_tweet(target)
+        {
+            results.push(target);
+        }
+        match candidate {
+            Value::Array(items) => {
+                for item in items {
+                    queue.push_back(item);
+                }
+            }
+            Value::Object(fields) => {
+                for v in fields.values() {
+                    queue.push_back(v);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    results
+}
+
+fn is_any_tweet(value: &Value) -> bool {
+    value
+        .get("__typename")
+        .and_then(Value::as_str)
+        .is_some_and(|name| name.starts_with("Tweet"))
+        || value.pointer("/legacy/full_text").is_some()
+        || value.get("article").is_some()
+        || value.get("note_tweet").is_some()
 }
 
 fn find_tweet_result<'a>(value: &'a Value, tweet_id: &str) -> Option<&'a Value> {
     let mut pending = vec![value];
+    let mut best_match = None;
+    let mut best_score = 0;
+
     while let Some(candidate) = pending.pop() {
         if let Some(target) = unwrap_tweet_result(candidate)
             && is_target_tweet(target, tweet_id)
         {
-            return Some(target);
+            let score = tweet_detail_score(target);
+            if best_match.is_none() || score > best_score {
+                best_match = Some(target);
+                best_score = score;
+            }
         }
         match candidate {
             Value::Array(items) => pending.extend(items),
@@ -285,7 +502,26 @@ fn find_tweet_result<'a>(value: &'a Value, tweet_id: &str) -> Option<&'a Value> 
         }
     }
 
-    None
+    best_match
+}
+
+fn tweet_detail_score(value: &Value) -> u8 {
+    u8::from(
+        value.pointer("/core/user_results/result").is_some()
+            || value.pointer("/user_results/result").is_some(),
+    ) + u8::from(
+        value
+            .pointer("/legacy/created_at")
+            .and_then(Value::as_str)
+            .is_some_and(|date| !date.is_empty()),
+    ) + u8::from(
+        value
+            .pointer("/legacy/full_text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+            || value.get("article").is_some()
+            || value.get("note_tweet").is_some(),
+    )
 }
 
 fn is_target_tweet(value: &Value, tweet_id: &str) -> bool {
@@ -337,6 +573,7 @@ fn extract_tweet_detail(target: &Value, target_id: &str) -> TweetDetail {
         url,
         media_urls,
         local_media: Vec::new(),
+        replies: Vec::new(),
     }
 }
 
@@ -353,7 +590,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        extract_article_title, extract_tweet_detail, find_tweet_result, parse_tweet_detail_response,
+        extract_article_title, extract_tweet_detail, find_tweet_result,
+        parse_tweet_detail_response, parse_tweet_detail_response_with_options,
     };
     use crate::{ContentSubtype, ContentType, TweetType, error_excerpt};
 
@@ -539,8 +777,139 @@ mod tests {
     }
 
     #[test]
+    fn complete_target_wins_over_duplicate_reference_stub() {
+        let complete = json!({
+            "__typename": "Tweet",
+            "rest_id": "123",
+            "core": {
+                "user_results": {
+                    "result": {
+                        "core": {"screen_name": "alice", "name": "Alice"}
+                    }
+                }
+            },
+            "legacy": {
+                "full_text": "Complete post",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018"
+            }
+        });
+        let reference_stub = json!({
+            "__typename": "Tweet",
+            "rest_id": "123"
+        });
+        let response = json!({
+            "data": {
+                "results": [complete, reference_stub]
+            }
+        });
+
+        let detail = parse_tweet_detail_response(&response, "123")
+            .expect("the complete target should be selected");
+        assert_eq!(detail.author_handle, "alice");
+        assert_eq!(detail.text, "Complete post");
+    }
+
+    #[test]
     fn error_summaries_are_bounded() {
         assert_eq!(error_excerpt("abcdef", 3), "abc…");
         assert_eq!(error_excerpt("abc", 3), "abc");
+    }
+
+    #[test]
+    fn replies_are_extracted_when_requested() {
+        let main_tweet = json!({
+            "__typename": "Tweet",
+            "rest_id": "100",
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": {"screen_name": "alice", "name": "Alice"}
+                    }
+                }
+            },
+            "legacy": {
+                "full_text": "Main post",
+                "created_at": "Wed Oct 10 20:19:24 +0000 2018"
+            }
+        });
+        let reply_tweet = json!({
+            "__typename": "Tweet",
+            "rest_id": "101",
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": {"screen_name": "bob", "name": "Bob"}
+                    }
+                }
+            },
+            "legacy": {
+                "full_text": "Reply post",
+                "created_at": "Wed Oct 10 20:20:24 +0000 2018",
+                "in_reply_to_status_id_str": "100"
+            }
+        });
+        let unrelated_tweet = json!({
+            "__typename": "Tweet",
+            "rest_id": "999",
+            "core": {
+                "user_results": {
+                    "result": {
+                        "legacy": {"screen_name": "advertiser", "name": "Advertiser"}
+                    }
+                }
+            },
+            "legacy": {
+                "full_text": "Promoted post",
+                "created_at": "Wed Oct 10 20:21:24 +0000 2018",
+                "conversation_id_str": "999"
+            }
+        });
+        let response = json!({
+            "data": {
+                "threaded_conversation_with_injections_v2": {
+                    "instructions": [{
+                        "entries": [
+                            {
+                                "entryId": "tweet-100",
+                                "content": {
+                                    "itemContent": {
+                                        "tweet_results": {"result": main_tweet}
+                                    }
+                                }
+                            },
+                            {
+                                "entryId": "conversationthread-101",
+                                "content": {
+                                    "itemContent": {
+                                        "tweet_results": {"result": reply_tweet}
+                                    }
+                                }
+                            },
+                            {
+                                "entryId": "promoted-tweet-999",
+                                "content": {
+                                    "itemContent": {
+                                        "tweet_results": {"result": unrelated_tweet}
+                                    }
+                                }
+                            }
+                        ]
+                    }]
+                }
+            }
+        });
+
+        let without_replies = parse_tweet_detail_response_with_options(&response, "100", false)
+            .expect("main tweet should be parsed");
+        assert_eq!(without_replies.id, "100");
+        assert!(without_replies.replies.is_empty());
+
+        let with_replies = parse_tweet_detail_response_with_options(&response, "100", true)
+            .expect("main tweet with replies should be parsed");
+        assert_eq!(with_replies.id, "100");
+        assert_eq!(with_replies.replies.len(), 1);
+        assert_eq!(with_replies.replies[0].id, "101");
+        assert_eq!(with_replies.replies[0].author_handle, "bob");
+        assert_eq!(with_replies.replies[0].text, "Reply post");
     }
 }

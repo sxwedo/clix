@@ -9,7 +9,9 @@ mod content;
 mod tweet;
 
 pub use content::{extract_author, extract_media_urls};
-pub use tweet::{TweetDetail, fetch_article_title, fetch_tweet_detail};
+pub use tweet::{
+    TweetDetail, fetch_article_title, fetch_tweet_detail, fetch_tweet_detail_with_options,
+};
 
 const X_BEARER_TOKEN: &str = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 const X_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
