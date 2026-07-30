@@ -3,6 +3,7 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result};
@@ -17,6 +18,84 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 
 const MAX_CONCURRENT_MEDIA_REQUESTS: usize = 4;
+
+static TITLE_SELECTORS: LazyLock<[(Selector, bool); 3]> = LazyLock::new(|| {
+    [
+        (
+            Selector::parse("#activity-name").expect("valid title selector"),
+            false,
+        ),
+        (
+            Selector::parse("meta[property=\"og:title\"]").expect("valid title meta selector"),
+            true,
+        ),
+        (
+            Selector::parse("title").expect("valid title selector"),
+            false,
+        ),
+    ]
+});
+static AUTHOR_SELECTORS: LazyLock<[(Selector, bool); 4]> = LazyLock::new(|| {
+    [
+        (
+            Selector::parse("#js_name").expect("valid author selector"),
+            false,
+        ),
+        (
+            Selector::parse("meta[property=\"og:article:author\"]")
+                .expect("valid author meta selector"),
+            true,
+        ),
+        (
+            Selector::parse("meta[name=\"author\"]").expect("valid author meta selector"),
+            true,
+        ),
+        (
+            Selector::parse(".profile_meta_value").expect("valid author selector"),
+            false,
+        ),
+    ]
+});
+static PUBLISH_TIME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?:var\s+createTime\s*=\s*"(\d+)"|var\s+ct\s*=\s*"(\d+)")"#)
+        .expect("valid publish-time regex")
+});
+static PUBLISH_TIME_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("#publish_time").expect("valid publish-time selector"));
+static CANONICAL_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"var\s+msg_link\s*=\s*"(https?://[^"]+)""#).expect("valid canonical URL regex")
+});
+static CONTENT_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("#js_content").expect("valid article-content selector"));
+static IMAGE_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("img").expect("valid image selector"));
+static DATA_SRC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)<img\s+[^>]*?data-src="([^"]+)"[^>]*>"#).expect("valid image data-src regex")
+});
+static SRC_ATTRIBUTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\ssrc\s*=\s*"([^"]*)""#).expect("valid image src-attribute regex")
+});
+static HEADING_CANDIDATE_SELECTOR: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("p, h1, h2, h3, h4, h5, h6").expect("valid heading-candidate selector")
+});
+static CODE_BLOCK_SELECTOR: LazyLock<Selector> = LazyLock::new(|| {
+    Selector::parse("pre, ul.code-snippet__list, section.code-snippet")
+        .expect("valid code-block selector")
+});
+static CODE_LINE_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("code, li").expect("valid code-line selector"));
+static HEADING_CHILD_SELECTOR: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("span, strong, b").expect("valid heading-child selector"));
+static HEADING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:[一二三四五六七八九十0-9]+[、.．]|（[一二三四五六七八九十0-9]+）|\([一二三四五六七八九十0-9]+\)|第[一二三四五六七八九十0-9]+[章部分节篇]|引言|结语|总结|前言|目录)",
+    )
+    .expect("valid heading regex")
+});
+static SUB_HEADING_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:\d+\.\d+|（[一二三四五六七八九十0-9]+）|\([一二三四五六七八九十0-9]+\))")
+        .expect("valid sub-heading regex")
+});
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum ReadOutputFormat {
@@ -188,13 +267,9 @@ pub async fn fetch_article_detail(client: &reqwest::Client, url: &str) -> Result
 }
 
 fn extract_title(document: &Html) -> String {
-    let selectors = ["#activity-name", "meta[property=\"og:title\"]", "title"];
-    for sel_str in selectors {
-        let Ok(sel) = Selector::parse(sel_str) else {
-            continue;
-        };
-        if let Some(element) = document.select(&sel).next() {
-            let text = if sel_str.starts_with("meta") {
+    for (selector, is_meta) in TITLE_SELECTORS.iter() {
+        if let Some(element) = document.select(selector).next() {
+            let text = if *is_meta {
                 element.value().attr("content").unwrap_or("").to_string()
             } else {
                 element.text().collect::<Vec<_>>().join(" ")
@@ -209,18 +284,9 @@ fn extract_title(document: &Html) -> String {
 }
 
 fn extract_author(document: &Html) -> String {
-    let selectors = [
-        "#js_name",
-        "meta[property=\"og:article:author\"]",
-        "meta[name=\"author\"]",
-        ".profile_meta_value",
-    ];
-    for sel_str in selectors {
-        let Ok(sel) = Selector::parse(sel_str) else {
-            continue;
-        };
-        if let Some(element) = document.select(&sel).next() {
-            let text = if sel_str.starts_with("meta") {
+    for (selector, is_meta) in AUTHOR_SELECTORS.iter() {
+        if let Some(element) = document.select(selector).next() {
+            let text = if *is_meta {
                 element.value().attr("content").unwrap_or("").to_string()
             } else {
                 element.text().collect::<Vec<_>>().join(" ")
@@ -235,9 +301,7 @@ fn extract_author(document: &Html) -> String {
 }
 
 fn extract_publish_time(raw_html: &str) -> Option<String> {
-    if let Ok(re) = Regex::new(r#"(?:var\s+createTime\s*=\s*"(\d+)"|var\s+ct\s*=\s*"(\d+)")"#)
-        && let Some(caps) = re.captures(raw_html)
-    {
+    if let Some(caps) = PUBLISH_TIME_RE.captures(raw_html) {
         let ts_str = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str())?;
         if let Ok(ts) = ts_str.parse::<i64>()
             && let Some(dt) = DateTime::<Utc>::from_timestamp(ts, 0)
@@ -246,10 +310,7 @@ fn extract_publish_time(raw_html: &str) -> Option<String> {
         }
     }
     let document = Html::parse_document(raw_html);
-    let Ok(sel) = Selector::parse("#publish_time") else {
-        return None;
-    };
-    if let Some(element) = document.select(&sel).next() {
+    if let Some(element) = document.select(&PUBLISH_TIME_SELECTOR).next() {
         let text = element.text().collect::<Vec<_>>().join(" ");
         let clean = text.trim();
         if !clean.is_empty() {
@@ -260,26 +321,18 @@ fn extract_publish_time(raw_html: &str) -> Option<String> {
 }
 
 fn extract_canonical_url(raw_html: &str) -> Option<String> {
-    let Ok(re) = Regex::new(r#"var\s+msg_link\s*=\s*"(https?://[^"]+)""#) else {
-        return None;
-    };
-    let caps = re.captures(raw_html)?;
+    let caps = CANONICAL_URL_RE.captures(raw_html)?;
     Some(caps.get(1)?.as_str().replace("\\x26", "&"))
 }
 
 fn extract_content_and_media(document: &Html) -> (String, Vec<String>) {
-    let Ok(js_content_sel) = Selector::parse("#js_content") else {
+    let Some(container) = document.select(&CONTENT_SELECTOR).next() else {
         return (String::new(), Vec::new());
     };
 
-    let Some(container) = document.select(&js_content_sel).next() else {
-        return (String::new(), Vec::new());
-    };
-
-    let img_sel = Selector::parse("img").unwrap();
     let mut media_urls = Vec::new();
 
-    for img in container.select(&img_sel) {
+    for img in container.select(&IMAGE_SELECTOR) {
         let val = img.value();
         let src = val.attr("data-src").or_else(|| val.attr("src"));
         if let Some(url) = src {
@@ -299,12 +352,14 @@ fn extract_content_and_media(document: &Html) -> (String, Vec<String>) {
 #[must_use]
 fn preprocess_html_for_markdown(html: &str) -> String {
     // 1. Convert data-src="..." to src="..." if src is missing or empty
-    let re_data_src = Regex::new(r#"(?i)<img\s+[^>]*?data-src="([^"]+)"[^>]*>"#).unwrap();
-    let html_with_src = re_data_src
+    let html_with_src = DATA_SRC_RE
         .replace_all(html, |caps: &regex::Captures| {
             let img_tag = &caps[0];
             let data_src = &caps[1];
-            if !img_tag.contains("src=") || img_tag.contains(r#"src=""#) {
+            if SRC_ATTRIBUTE_RE
+                .captures(img_tag)
+                .is_none_or(|src| src[1].trim().is_empty())
+            {
                 format!(r#"<img src="{data_src}">"#)
             } else {
                 img_tag.to_string()
@@ -321,14 +376,10 @@ fn preprocess_html_for_markdown(html: &str) -> String {
 
     // 3. Wrap WeChat pseudo-headings (<p>/<section>/<div> with bold/large text or section numbering) into <h2> or <h3>
     let document = Html::parse_fragment(&html_with_code);
-    let Ok(p_sel) = Selector::parse("p, h1, h2, h3, h4, h5, h6") else {
-        return html_with_code;
-    };
-
     let mut replacements = Vec::new();
     let mut in_toc_block = false;
 
-    for element in document.select(&p_sel) {
+    for element in document.select(&HEADING_CANDIDATE_SELECTOR) {
         let text = element.text().collect::<Vec<_>>().join(" ");
         let clean = text.trim();
         if clean.is_empty() || clean.contains('\n') {
@@ -381,13 +432,9 @@ fn preprocess_html_for_markdown(html: &str) -> String {
 #[must_use]
 fn preprocess_code_blocks(html: &str) -> String {
     let document = Html::parse_fragment(html);
-    let Ok(pre_sel) = Selector::parse("pre, ul.code-snippet__list, section.code-snippet") else {
-        return html.to_string();
-    };
-
     let mut replacements: Vec<(String, String)> = Vec::new();
 
-    for element in document.select(&pre_sel) {
+    for element in document.select(&CODE_BLOCK_SELECTOR) {
         let outer_html = element.html();
 
         if replacements
@@ -404,12 +451,8 @@ fn preprocess_code_blocks(html: &str) -> String {
             .unwrap_or("")
             .trim();
 
-        let Ok(code_sel) = Selector::parse("code, li") else {
-            continue;
-        };
-
         let mut lines = Vec::new();
-        for code_elem in element.select(&code_sel) {
+        for code_elem in element.select(&CODE_LINE_SELECTOR) {
             let line_text = code_elem.text().collect::<Vec<_>>().join("");
             let clean_line = line_text
                 .replace("&nbsp;", " ")
@@ -462,10 +505,7 @@ fn has_heading_style(element: &scraper::ElementRef) -> bool {
         return true;
     }
 
-    let Ok(span_sel) = Selector::parse("span, strong, b") else {
-        return false;
-    };
-    for child in element.select(&span_sel) {
+    for child in element.select(&HEADING_CHILD_SELECTOR) {
         let child_style = child.value().attr("style").unwrap_or("");
         let c_name = child.value().name();
         let c_bold = child_style.contains("font-weight: bold")
@@ -488,22 +528,12 @@ fn has_heading_style(element: &scraper::ElementRef) -> bool {
 
 #[must_use]
 fn is_heading_pattern(text: &str) -> bool {
-    let Ok(re) = Regex::new(
-        r"^(?:[一二三四五六七八九十0-9]+[、.．]|（[一二三四五六七八九十0-9]+）|\([一二三四五六七八九十0-9]+\)|第[一二三四五六七八九十0-9]+[章部分节篇]|引言|结语|总结|前言|目录)",
-    ) else {
-        return false;
-    };
-    re.is_match(text)
+    HEADING_RE.is_match(text)
 }
 
 #[must_use]
 fn is_sub_heading_pattern(text: &str) -> bool {
-    let Ok(re) =
-        Regex::new(r"^(?:\d+\.\d+|（[一二三四五六七八九十0-9]+）|\([一二三四五六七八九十0-9]+\))")
-    else {
-        return false;
-    };
-    re.is_match(text)
+    SUB_HEADING_RE.is_match(text)
 }
 
 #[must_use]
@@ -988,5 +1018,51 @@ mod tests {
             default_output_file_name("公众号", "微信文章标题测试", "md"),
             "公众号:微信文章标题测试.md"
         );
+    }
+
+    #[test]
+    fn cached_metadata_parsers_preserve_wechat_fields() {
+        let raw_html = r#"
+            <html>
+              <head><meta property="og:title" content="Cached title"></head>
+              <body><div id="js_name">Cached author</div></body>
+              <script>
+                var ct = "1753873200";
+                var msg_link = "https://mp.weixin.qq.com/s/example\x26scene=1";
+              </script>
+            </html>
+        "#;
+        let document = Html::parse_document(raw_html);
+
+        assert_eq!(extract_title(&document), "Cached title");
+        assert_eq!(extract_author(&document), "Cached author");
+        assert_eq!(
+            extract_publish_time(raw_html).as_deref(),
+            Some("2025-07-30 11:00:00")
+        );
+        assert_eq!(
+            extract_canonical_url(raw_html).as_deref(),
+            Some("https://mp.weixin.qq.com/s/example&scene=1")
+        );
+    }
+
+    #[test]
+    fn lazy_image_data_src_is_promoted_without_overwriting_a_real_src() {
+        let promoted =
+            preprocess_html_for_markdown(r#"<p><img data-src="https://example.com/lazy.png"></p>"#);
+        assert!(promoted.contains(r#"<img src="https://example.com/lazy.png">"#));
+
+        let preserved = preprocess_html_for_markdown(
+            r#"<p><img src="https://example.com/eager.png" data-src="https://example.com/lazy.png"></p>"#,
+        );
+        assert!(preserved.contains(r#"src="https://example.com/eager.png""#));
+    }
+
+    #[test]
+    fn cached_heading_patterns_keep_existing_classification() {
+        assert!(is_heading_pattern("一、背景"));
+        assert!(is_heading_pattern("第2部分"));
+        assert!(is_sub_heading_pattern("2.1 方法"));
+        assert!(!is_heading_pattern("普通正文"));
     }
 }
