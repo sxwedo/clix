@@ -15,7 +15,7 @@
 
 ---
 
-`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, social media content preservation, GitHub exports, WeChat article downloading, and rich terminal Markdown rendering.
+`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, RSS subscription snapshots, social media content preservation, GitHub exports, WeChat article downloading, and rich terminal Markdown rendering.
 
 It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
 
@@ -23,11 +23,12 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
+- 📰 **RSS Subscription Fetcher (`clix rss fetch`)**: Configure RSS, Atom, or JSON Feed subscriptions once and fetch their latest entries into one Markdown or JSON snapshot.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
 - 🖼️ **Terminal Markdown Viewer (`clix md view`)**: View Markdown/MDX directly in your terminal with native high-resolution image rendering (iTerm2 / Kitty protocol).
-- 🚀 **Blazing Fast & Lightweight**: Powered by Rust 2024 and Tokio async I/O. Memory footprint under 20MB.
+- 🚀 **Bounded & Efficient**: Powered by Rust 2024 and Tokio async I/O, with explicit concurrency and response-size limits on network-heavy paths.
 
 ---
 
@@ -38,6 +39,7 @@ clix/
 ├── crates/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
+│   ├── clix-rss-fetch/    # Config-driven RSS/Atom/JSON Feed snapshot exporter
 │   ├── clix-view/         # Terminal Markdown/MDX viewer
 │   ├── clix-wx-read/      # WeChat Official Account article reader
 │   ├── clix-x-api/        # Shared X auth, GraphQL parsing, and content/media types
@@ -49,6 +51,59 @@ clix/
 ---
 
 ## ✨ Available Tools
+
+### 📰 RSS Utilities (`clix rss`)
+
+#### 🔄 `clix rss fetch` / `clix-rss-fetch` — Subscription Fetcher
+
+Declare subscriptions in `~/.config/clix/config.toml`, then fetch their latest entries into a single Markdown or JSON snapshot. The parser supports RSS 0.x, RSS 1.0, RSS 2.0, Atom, and JSON Feed.
+
+- ⚙️ **Config-driven subscriptions:** Each `[[rss.feeds]]` block has a stable name, URL, and optional `enabled` flag.
+- 🔎 **Selective fetches:** `--feed` can be repeated or receive comma-separated names.
+- 🧭 **Normalized output:** Feed title, source, entry link, publication time, author, categories, and summary use one schema across feed formats.
+- ⚡ **Concurrent and resilient:** Feeds are fetched concurrently; one failed source is reported without discarding successful sources.
+- 🛡️ **Safe summaries:** Active HTML is sanitized before conversion to Markdown.
+- 💾 **Safe snapshots:** Output directories are created as needed and snapshots are atomically replaced.
+
+Configure subscriptions:
+
+```toml
+[rss]
+output = "rss.md"
+limit = 20
+
+[[rss.feeds]]
+name = "Rust Blog"
+url = "https://blog.rust-lang.org/feed.xml"
+
+[[rss.feeds]]
+name = "GitHub Blog"
+url = "https://github.blog/feed/"
+enabled = true
+```
+
+Fetch them:
+
+```sh
+# Fetch every enabled subscription using the configured output and limit
+clix rss fetch
+
+# Fetch one or more named subscriptions
+clix rss fetch --feed "Rust Blog"
+clix rss fetch --feed "Rust Blog,GitHub Blog"
+
+# CLI values override fetch defaults; .json output also infers JSON format
+clix rss fetch --limit 10 --format json -o latest-rss.json
+
+# Equivalent standalone binary
+clix-rss-fetch --feed "Rust Blog" -o rust-news.md
+```
+
+`[rss].output` is resolved from the current working directory when it is relative. `--format` takes precedence over the output extension; without `--format`, a `.json` output selects JSON and every other extension selects Markdown.
+
+Each entry contains normalized metadata, its article link, and a summary of at most 1,200 characters. The feed-provided `summary` is preferred; when it is absent, the feed-provided content body is used as the summary. This command does not crawl the linked website for the full article.
+
+---
 
 ### 🟢 WeChat Utilities (`clix wx`)
 
@@ -149,7 +204,7 @@ clix-view article.mdx
 
 ## ⚙️ Configuration
 
-Credentials and settings are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
+Credentials, RSS subscriptions, and fetch defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
 
 ```sh
 clix config init   # creates ~/.config/clix/config.toml (mode 0600)
@@ -169,6 +224,17 @@ The generated file is self-documenting:
 # auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[rss]
+# Default output path. A .json extension selects JSON.
+# output = "rss.md"
+# Maximum entries retained from each feed.
+# limit = 20
+
+# [[rss.feeds]]
+# name = "Rust Blog"
+# url = "https://blog.rust-lang.org/feed.xml"
+# enabled = true
 ```
 
 ### Credential Resolution Priority
@@ -204,6 +270,7 @@ cargo build --workspace --release
 
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
+# - clix-rss-fetch     (Standalone RSS subscription fetcher)
 # - clix-wx-read       (Standalone WeChat Article CLI)
 # - clix-gh-stars      (Standalone GitHub Stars CLI)
 # - clix-x-bookmarks   (Standalone X Bookmarks CLI)

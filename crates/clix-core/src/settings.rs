@@ -35,6 +35,19 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # auth_token = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"
+
+[rss]
+# Default output path. Relative paths are resolved from the current directory.
+# The .json extension selects JSON; every other extension defaults to Markdown.
+# output = \"rss.md\"
+# Maximum entries kept from each feed (default: 20).
+# limit = 20
+
+# Add one block per subscription. `enabled` defaults to true.
+# [[rss.feeds]]
+# name = \"Rust Blog\"
+# url = \"https://blog.rust-lang.org/feed.xml\"
+# enabled = true
 ";
 
 /// Top-level configuration mirror of `config.toml`.
@@ -44,6 +57,8 @@ pub struct Settings {
     pub github: GitHubSettings,
     #[serde(default)]
     pub x: XSettings,
+    #[serde(default)]
+    pub rss: RssSettings,
 }
 
 /// `[github]` section: explicit GitHub credentials.
@@ -62,6 +77,36 @@ pub struct XSettings {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub ct0: Option<String>,
+}
+
+/// `[rss]` section: RSS subscriptions and fetch defaults.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct RssSettings {
+    /// Default export path. Relative paths use the caller's current directory.
+    #[serde(default)]
+    pub output: Option<PathBuf>,
+    /// Default maximum number of entries retained from each feed.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Configured RSS, Atom, or JSON Feed subscriptions.
+    #[serde(default)]
+    pub feeds: Vec<RssFeedSettings>,
+}
+
+/// One `[[rss.feeds]]` subscription.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RssFeedSettings {
+    /// Stable human-readable name used by `clix rss fetch --feed`.
+    pub name: String,
+    /// HTTP(S) URL of the RSS, Atom, or JSON Feed document.
+    pub url: String,
+    /// Whether this subscription participates in fetches.
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+}
+
+const fn enabled_by_default() -> bool {
+    true
 }
 
 impl Settings {
@@ -158,6 +203,9 @@ mod tests {
         assert!(settings.github.username.is_none());
         assert!(settings.x.auth_token.is_none());
         assert!(settings.x.ct0.is_none());
+        assert!(settings.rss.output.is_none());
+        assert!(settings.rss.limit.is_none());
+        assert!(settings.rss.feeds.is_empty());
     }
 
     #[test]
@@ -170,6 +218,7 @@ auth_token = \"abc\"
         assert_eq!(settings.x.auth_token.as_deref(), Some("abc"));
         assert!(settings.x.ct0.is_none());
         assert!(settings.github.token.is_none());
+        assert!(settings.rss.feeds.is_empty());
     }
 
     #[test]
@@ -178,5 +227,42 @@ auth_token = \"abc\"
         let settings: Settings = toml::from_str(text).expect("github-only toml");
         assert_eq!(settings.github.token.as_deref(), Some("t"));
         assert!(settings.x.auth_token.is_none());
+        assert!(settings.rss.feeds.is_empty());
+    }
+
+    #[test]
+    fn rss_subscriptions_parse_with_defaults_and_overrides() {
+        let text = r#"
+[rss]
+output = "news.json"
+limit = 12
+
+[[rss.feeds]]
+name = "Rust Blog"
+url = "https://blog.rust-lang.org/feed.xml"
+
+[[rss.feeds]]
+name = "Paused"
+url = "https://example.com/feed.xml"
+enabled = false
+"#;
+        let settings: Settings = toml::from_str(text).expect("rss config");
+        assert_eq!(
+            settings.rss.output.as_deref(),
+            Some(std::path::Path::new("news.json"))
+        );
+        assert_eq!(settings.rss.limit, Some(12));
+        assert_eq!(settings.rss.feeds.len(), 2);
+        assert!(settings.rss.feeds[0].enabled);
+        assert!(!settings.rss.feeds[1].enabled);
+    }
+
+    #[test]
+    fn generated_config_template_includes_a_valid_rss_section() {
+        let settings: Settings =
+            toml::from_str(DEFAULT_CONFIG_TEMPLATE).expect("default template should parse");
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[rss]"));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("[[rss.feeds]]"));
+        assert!(settings.rss.feeds.is_empty());
     }
 }

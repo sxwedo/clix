@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
+use clix_rss_fetch::FetchArgs;
 use clix_view::ViewArgs;
 use clix_x_bookmarks::BookmarksArgs;
 use clix_x_read::ReadArgs;
@@ -27,6 +28,11 @@ enum Commands {
     Gh {
         #[command(subcommand)]
         command: GhCommands,
+    },
+    /// RSS, Atom, and JSON Feed subscription tools
+    Rss {
+        #[command(subcommand)]
+        command: RssCommands,
     },
     /// X (Twitter) tools & utilities
     X {
@@ -54,6 +60,12 @@ enum Commands {
 enum GhCommands {
     /// Export all starred repositories for a GitHub user (Markdown, URLs, JSON)
     Stars(StarsArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum RssCommands {
+    /// Fetch configured subscriptions into one Markdown or JSON snapshot
+    Fetch(FetchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -94,6 +106,14 @@ fn run(cli: Cli) -> Result<()> {
             run_async(async move {
                 match command {
                     GhCommands::Stars(args) => clix_gh_stars::run(args, &settings).await,
+                }
+            })
+        }
+        Commands::Rss { command } => {
+            let settings = clix_core::settings::Settings::load()?;
+            run_async(async move {
+                match command {
+                    RssCommands::Fetch(args) => clix_rss_fetch::run(args, &settings).await,
                 }
             })
         }
@@ -142,7 +162,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use clix_gh_stars::OutputFormat;
 
-    use super::{Cli, Commands, GhCommands, MdCommands, WxCommands};
+    use super::{Cli, Commands, GhCommands, MdCommands, RssCommands, WxCommands};
 
     #[test]
     fn command_tree_is_internally_consistent() {
@@ -185,6 +205,32 @@ mod tests {
             } if args.path == std::path::Path::new("article.md")
         ));
     }
+
+    #[test]
+    fn parses_the_documented_rss_fetch_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "rss",
+            "fetch",
+            "--feed",
+            "Rust Blog",
+            "--format",
+            "json",
+            "--output",
+            "rss.json",
+        ])
+        .expect("documented RSS fetch arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::Fetch(args)
+            } if args.feeds == ["Rust Blog"]
+                && args.format == Some(clix_rss_fetch::OutputFormat::Json)
+                && args.output.as_deref() == Some(std::path::Path::new("rss.json"))
+        ));
+    }
+
     #[test]
     fn parses_the_documented_wechat_read_invocation() {
         let cli = Cli::try_parse_from(["clix", "wx", "read", "https://mp.weixin.qq.com/s/123456"])
