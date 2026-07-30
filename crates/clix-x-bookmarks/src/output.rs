@@ -16,7 +16,7 @@ use fs2::FileExt;
 
 use crate::{
     api::article_link_index,
-    model::{BookmarkState, OutputFormat, STATE_VERSION, TweetBookmark},
+    model::{OutputFormat, TweetBookmark},
 };
 
 const MARKDOWN_HEADER: &str = "| Content Type | Subtypes | Author | Published At | Tweet | Media / Links | Bookmarks | Likes | Replies | Views | Reposts | Quotes |";
@@ -24,22 +24,22 @@ const MARKDOWN_SEPARATOR: &str =
     "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |";
 const MARKDOWN_STATUS_MARKER: &str = "[View Status](";
 
-pub struct ExportLocks {
-    _files: [File; 2],
+pub struct ExportLock {
+    _file: File,
 }
 
-pub fn acquire_export_locks(output_path: &Path, state_path: &Path) -> Result<ExportLocks> {
-    let mut lock_paths = [
-        sibling_lock_path(&comparable_path(output_path)?)?,
-        sibling_lock_path(&comparable_path(state_path)?)?,
-    ];
-    lock_paths.sort_unstable();
+/// Acquire an exclusive lock guarding the output file against concurrent exports.
+pub fn acquire_export_lock(output_path: &Path) -> Result<ExportLock> {
+    let lock_path = sibling_lock_path(&comparable_path(output_path)?)?;
+    let file = acquire_lock(&lock_path)?;
+    Ok(ExportLock { _file: file })
+}
 
-    let first = acquire_lock(&lock_paths[0])?;
-    let second = acquire_lock(&lock_paths[1])?;
-    Ok(ExportLocks {
-        _files: [first, second],
-    })
+/// Path of the legacy JSON sidecar that preceded the redb store.
+///
+/// `<output>.md` → `<output>.md.state.json`, matching the historical default.
+pub fn legacy_state_path(output_path: &Path) -> PathBuf {
+    output_path.with_extension("state.json")
 }
 
 fn sibling_lock_path(target: &Path) -> Result<PathBuf> {
@@ -154,18 +154,6 @@ impl ExistingOutput {
     }
 }
 
-pub fn default_state_path(output_path: &Path) -> PathBuf {
-    let candidate = output_path.with_extension("state.json");
-    if candidate == output_path {
-        let file_name = output_path
-            .file_name()
-            .map_or_else(|| "x_bookmarks".into(), |name| name.to_string_lossy());
-        output_path.with_file_name(format!("{file_name}.sync-state.json"))
-    } else {
-        candidate
-    }
-}
-
 pub fn ensure_distinct_paths(output_path: &Path, state_path: &Path) -> Result<()> {
     let output = comparable_path(output_path)?;
     let state = comparable_path(state_path)?;
@@ -194,29 +182,6 @@ fn comparable_path(path: &Path) -> Result<PathBuf> {
         .or_else(|_| std::path::absolute(parent))
         .with_context(|| format!("failed to resolve parent directory {}", parent.display()))?;
     Ok(resolved_parent.join(file_name))
-}
-
-pub fn load_state_cache(path: &Path) -> Result<(HashSet<String>, BTreeMap<String, String>)> {
-    if !path.exists() {
-        return Ok((HashSet::new(), BTreeMap::new()));
-    }
-
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read state file {}", path.display()))?;
-    let state: BookmarkState = serde_json::from_str(&content)
-        .with_context(|| format!("invalid state file {}", path.display()))?;
-    if state.version != STATE_VERSION {
-        bail!(
-            "Unsupported bookmark state version {} in {} (expected {})",
-            state.version,
-            path.display(),
-            STATE_VERSION
-        );
-    }
-    Ok((
-        state.seen_tweet_ids.into_iter().collect(),
-        state.article_titles,
-    ))
 }
 
 pub fn markdown_status_ids_and_count(content: &str) -> (HashSet<String>, usize) {
@@ -430,13 +395,6 @@ fn status_id_from_url(value: &str) -> Option<String> {
         }
     }
     None
-}
-
-pub fn write_state(path: &Path, state: &BookmarkState) -> Result<()> {
-    let content =
-        serde_json::to_string_pretty(state).context("failed to serialize bookmark state")?;
-    atomic_write(path, content.as_bytes())
-        .with_context(|| format!("failed to write state file {}", path.display()))
 }
 
 pub fn write_output(

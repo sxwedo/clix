@@ -2,13 +2,18 @@ mod api;
 mod media;
 mod model;
 mod output;
+mod state;
 
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::{Path, PathBuf},
-};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+type KnownState = (
+    HashSet<String>,
+    BTreeMap<String, String>,
+    Option<ExistingOutput>,
+);
+
+use anyhow::{Context, Result, bail};
 use clix_core::ui;
 pub use clix_x_api::{ContentSubtype, ContentType};
 use clix_x_api::{XCredentials, build_media_client};
@@ -20,75 +25,121 @@ use api::{
 #[cfg(test)]
 use api::{extract_tweet, has_bookmark_timeline, page_is_known_boundary, parse_bookmarks_response};
 use media::download_all_media;
-use model::BookmarkState;
 pub use model::{BookmarksArgs, LinkPreview, OutputFormat, TweetBookmark, TweetMetrics};
 use output::{
-    ExistingOutput, acquire_export_locks, append_output, default_state_path, ensure_distinct_paths,
-    load_state_cache, write_output, write_state,
+    ExistingOutput, acquire_export_lock, append_output, ensure_distinct_paths, legacy_state_path,
+    write_output,
 };
 #[cfg(test)]
 use output::{format_tweet_cell, markdown_status_ids_and_count, render_output};
+use state::BookmarksDb;
 
-#[derive(Default)]
-struct PreviousExport {
-    existing_output: Option<ExistingOutput>,
-    known_ids: HashSet<String>,
-    article_titles: BTreeMap<String, String>,
+/// Default bookmark state database path: `~/.config/clix/bookmarks.redb`.
+fn default_state_db_path() -> PathBuf {
+    clix_core::settings::config_dir().join("bookmarks.redb")
 }
 
-fn load_previous_export(
+/// Migrate a legacy `<output>.state.json` sidecar into the redb store.
+///
+/// Only runs when the database is empty. On success the JSON file is renamed
+/// to `<output>.state.json.bak`. Returns `true` when a migration happened.
+fn migrate_legacy_state(db: &BookmarksDb, output_path: &Path) -> Result<bool> {
+    let legacy = legacy_state_path(output_path);
+    if !legacy.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&legacy)
+        .with_context(|| format!("failed to read legacy state {}", legacy.display()))?;
+    let state: model::BookmarkState = serde_json::from_str(&content)
+        .with_context(|| format!("invalid legacy state {}", legacy.display()))?;
+    if state.version != model::STATE_VERSION {
+        ui::warn(format!(
+            "skipping legacy state migration: unsupported version {} in {}",
+            state.version,
+            legacy.display()
+        ));
+        return Ok(false);
+    }
+    let migrated = state.seen_tweet_ids.len();
+    let entries: Vec<(&str, &str)> = state
+        .seen_tweet_ids
+        .iter()
+        .map(|id| {
+            (
+                id.as_str(),
+                state.article_titles.get(id).map_or("", String::as_str),
+            )
+        })
+        .collect();
+    db.upsert(entries)?;
+    let backup: PathBuf = format!("{}.bak", legacy.display()).into();
+    std::fs::rename(&legacy, &backup)?;
+    ui::success(format!(
+        "migrated {migrated} bookmarks from {} to redb",
+        legacy.display()
+    ));
+    Ok(true)
+}
+
+/// Export the authenticated X account's bookmarks.
+///
+/// Resolve prior dedup state: known tweet IDs and cached article titles.
+///
+/// Existing output is folded in only for incremental runs.
+fn prepare_known_state(
+    db: &BookmarksDb,
     output_path: &Path,
-    state_path: &Path,
     format: OutputFormat,
     incremental: bool,
-) -> Result<PreviousExport> {
-    if !output_path.exists() {
-        return Ok(PreviousExport::default());
-    }
-
-    let existing_output = match ExistingOutput::load(output_path, format) {
-        Ok(existing) => Some(existing),
-        Err(error) if incremental => return Err(error),
-        Err(error) => {
-            ui::warn(format!(
-                "could not reuse existing Article titles from {}: {error:#}",
-                output_path.display()
-            ));
-            None
-        }
-    };
-    let (state_ids, state_titles) = match load_state_cache(state_path) {
-        Ok(cache) => cache,
-        Err(error) if incremental => return Err(error),
-        Err(error) => {
-            ui::warn(format!(
-                "could not reuse bookmark state from {}: {error:#}",
-                state_path.display()
-            ));
-            (HashSet::new(), BTreeMap::new())
-        }
-    };
-    let mut article_titles = existing_output
-        .as_ref()
-        .map(ExistingOutput::article_titles)
-        .unwrap_or_default();
-    article_titles.extend(state_titles);
+) -> Result<KnownState> {
     let mut known_ids = if incremental {
-        state_ids
+        db.known_ids()?
     } else {
         HashSet::new()
     };
-    if let Some(existing) = &existing_output
-        && incremental
-    {
-        known_ids.extend(existing.ids().iter().cloned());
-    }
+    let mut article_titles = db.article_titles()?;
 
-    Ok(PreviousExport {
-        existing_output,
-        known_ids,
-        article_titles,
-    })
+    let existing_output = if output_path.exists() {
+        match ExistingOutput::load(output_path, format) {
+            Ok(existing) => {
+                if incremental {
+                    known_ids.extend(existing.ids().iter().cloned());
+                }
+                Some(existing)
+            }
+            Err(error) if incremental => return Err(error),
+            Err(error) => {
+                ui::warn(format!(
+                    "could not reuse existing Article titles from {}: {error:#}",
+                    output_path.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    article_titles.extend(
+        existing_output
+            .as_ref()
+            .map(ExistingOutput::article_titles)
+            .unwrap_or_default(),
+    );
+
+    Ok((known_ids, article_titles, existing_output))
+}
+
+/// Build the `(tweet id, article title)` entries to persist from fetched bookmarks.
+fn state_entries(bookmarks: &[TweetBookmark]) -> Vec<(&str, &str)> {
+    bookmarks
+        .iter()
+        .map(|bookmark| {
+            let title = article_link_index(bookmark)
+                .and_then(|index| bookmark.links[index].title.as_deref())
+                .unwrap_or("");
+            (bookmark.id.as_str(), title)
+        })
+        .collect()
 }
 
 /// Export the authenticated X account's bookmarks.
@@ -97,7 +148,7 @@ fn load_previous_export(
 ///
 /// Returns an error for missing credentials, invalid output/state paths,
 /// unsuccessful X requests, incompatible incremental output, media-directory
-/// failures, or output/state serialization and write failures.
+/// failures, or output/state persistence failures.
 pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) -> Result<()> {
     let Some(credentials) = XCredentials::resolve(args.auth_token, args.ct0, &settings.x) else {
         bail!(
@@ -114,16 +165,18 @@ pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) 
         OutputFormat::Urls => PathBuf::from("x_bookmarks_urls.txt"),
         OutputFormat::Json => PathBuf::from("x_bookmarks.json"),
     });
-    let state_path = args
-        .state
-        .unwrap_or_else(|| default_state_path(&output_path));
+    let state_path = args.state.unwrap_or_else(default_state_db_path);
     ensure_distinct_paths(&output_path, &state_path)?;
-    let _export_locks = acquire_export_locks(&output_path, &state_path)?;
-    let PreviousExport {
-        existing_output,
-        mut known_ids,
-        mut article_titles,
-    } = load_previous_export(&output_path, &state_path, args.format, args.incremental)?;
+
+    let _output_lock = acquire_export_lock(&output_path)?;
+
+    let db = BookmarksDb::open(&state_path)?;
+    if db.is_empty()? {
+        migrate_legacy_state(&db, &output_path)?;
+    }
+
+    let (known_ids, article_titles, existing_output) =
+        prepare_known_state(&db, &output_path, args.format, args.incremental)?;
 
     let client = credentials.build_client()?;
 
@@ -136,14 +189,24 @@ pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) 
     )
     .await?;
 
-    if bookmarks.is_empty() && !args.incremental {
+    if bookmarks.is_empty() && args.incremental {
+        ui::success(format!(
+            "X bookmarks are already up to date; state saved to {}",
+            ui::style_bold(&state_path.display().to_string())
+        ));
+        return Ok(());
+    }
+    if bookmarks.is_empty() {
         bail!(
-            "No bookmarks found or failed to authenticate with X. Please verify your auth_token and ct0 values."
+            "No bookmarks found or failed to authenticate with X. \
+             Please verify your auth_token and ct0 values."
         );
     }
 
     apply_cached_article_titles(&mut bookmarks, &article_titles);
-    if !args.link_only {
+    if args.link_only {
+        // link_only keeps the article link only; skip title enrichment entirely
+    } else {
         enrich_article_titles(&client, &mut bookmarks).await;
     }
 
@@ -163,37 +226,9 @@ pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) 
         )?;
     } else {
         write_output(&bookmarks, &output_path, args.format, args.link_only)?;
-        known_ids.clear();
-        article_titles.clear();
+        db.clear()?;
     }
-
-    known_ids.extend(bookmarks.iter().map(|bookmark| bookmark.id.clone()));
-    for bookmark in &bookmarks {
-        if let Some(index) = article_link_index(bookmark)
-            && let Some(title) = &bookmark.links[index].title
-        {
-            article_titles.insert(bookmark.id.clone(), title.clone());
-        }
-    }
-    write_state(&state_path, &BookmarkState::new(known_ids, article_titles))?;
-
-    if args.incremental && bookmarks.is_empty() {
-        ui::success(format!(
-            "X bookmarks are already up to date; state saved to {}",
-            ui::style_bold(&state_path.display().to_string())
-        ));
-    } else {
-        let verb = if args.incremental {
-            "appended"
-        } else {
-            "exported"
-        };
-        ui::success(format!(
-            "{verb} {} X bookmarks to {}",
-            ui::style_bold(&bookmarks.len().to_string()),
-            ui::style_bold(&output_path.display().to_string())
-        ));
-    }
+    db.upsert(state_entries(&bookmarks))?;
 
     Ok(())
 }
@@ -202,19 +237,20 @@ pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) 
 mod tests {
     use std::{
         collections::{BTreeMap, HashSet},
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::json;
 
     use super::{
-        BookmarkState, ContentSubtype, ContentType, ExistingOutput, LinkPreview, OutputFormat,
-        TweetBookmark, TweetMetrics, acquire_export_locks, append_output, article_link_index,
-        default_state_path, ensure_distinct_paths, extract_tweet, format_tweet_cell,
-        has_bookmark_timeline, load_previous_export, load_state_cache,
-        markdown_status_ids_and_count, page_is_known_boundary, parse_bookmarks_response,
-        render_output, write_output, write_state,
+        BookmarksDb, ContentSubtype, ContentType, ExistingOutput, LinkPreview, OutputFormat,
+        TweetBookmark, TweetMetrics, acquire_export_lock, append_output, article_link_index,
+        ensure_distinct_paths, extract_tweet, format_tweet_cell, has_bookmark_timeline,
+        markdown_status_ids_and_count, migrate_legacy_state, page_is_known_boundary,
+        parse_bookmarks_response, render_output, write_output,
     };
+    use crate::model::STATE_VERSION;
 
     fn tweet_fixture(extra: serde_json::Value) -> serde_json::Value {
         let mut tweet = json!({
@@ -612,13 +648,10 @@ mod tests {
         let output = directory.path().join("bookmarks.json");
 
         assert!(ensure_distinct_paths(&output, &output).is_err());
-        assert_ne!(default_state_path(&output), output);
-
-        let state_named_output = directory.path().join("bookmarks.state.json");
         assert_ne!(
-            default_state_path(&state_named_output),
-            state_named_output,
-            "the default state path must never overwrite the output"
+            clix_core::settings::config_dir().join("bookmarks.redb"),
+            output,
+            "the default redb state path must never collide with the output"
         );
     }
 
@@ -762,7 +795,7 @@ mod tests {
     fn existing_export_bootstraps_state_and_state_round_trips() {
         let bookmark = bookmark_fixture("2076865068613206046");
         let output_path = temporary_path("md");
-        let state_path = temporary_path("state.json");
+        let state_path = temporary_path("redb");
         write_output(
             std::slice::from_ref(&bookmark),
             &output_path,
@@ -784,13 +817,14 @@ mod tests {
         );
 
         let titles = existing.article_titles();
-        write_state(
-            &state_path,
-            &BookmarkState::new(output_ids.clone(), titles.clone()),
-        )
-        .expect("state should be written");
-        let (loaded_ids, loaded_titles) =
-            load_state_cache(&state_path).expect("state cache should load");
+        let db = BookmarksDb::open(&state_path).expect("db should open");
+        let entries: Vec<(&str, &str)> = output_ids
+            .iter()
+            .map(|id| (id.as_str(), titles.get(id).map_or("", String::as_str)))
+            .collect();
+        db.upsert(entries).expect("state should be written");
+        let loaded_ids = db.known_ids().expect("ids should load");
+        let loaded_titles = db.article_titles().expect("titles should load");
         assert_eq!(loaded_ids, output_ids);
         assert_eq!(loaded_titles, titles);
         std::fs::remove_file(output_path).expect("temporary output should be removable");
@@ -829,7 +863,7 @@ mod tests {
     fn state_title_takes_precedence_over_the_rendered_title() {
         let bookmark = bookmark_fixture("2076865068613206046");
         let output_path = temporary_path("md");
-        let state_path = temporary_path("state.json");
+        let state_path = temporary_path("redb");
         write_output(
             std::slice::from_ref(&bookmark),
             &output_path,
@@ -837,23 +871,14 @@ mod tests {
             false,
         )
         .expect("output should be written");
-        write_state(
-            &state_path,
-            &BookmarkState::new(
-                HashSet::from([bookmark.id.clone()]),
-                BTreeMap::from([(bookmark.id.clone(), "Fresh API title".to_string())]),
-            ),
-        )
-        .expect("state should be written");
 
-        let previous =
-            load_previous_export(&output_path, &state_path, OutputFormat::Markdown, true)
-                .expect("previous export should load");
+        let db = BookmarksDb::open(&state_path).expect("db should open");
+        db.upsert(std::iter::once((bookmark.id.as_str(), "Fresh API title")))
+            .expect("state should be written");
+
+        let loaded_titles = db.article_titles().expect("titles should load");
         assert_eq!(
-            previous
-                .article_titles
-                .get(&bookmark.id)
-                .map(String::as_str),
+            loaded_titles.get(&bookmark.id).map(String::as_str),
             Some("Fresh API title")
         );
         std::fs::remove_file(output_path).expect("temporary output should be removable");
@@ -876,16 +901,51 @@ mod tests {
     fn export_lock_rejects_concurrent_updates_and_releases_on_drop() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let output = directory.path().join("bookmarks.md");
-        let state = directory.path().join("bookmarks.state.json");
 
-        let first =
-            acquire_export_locks(&output, &state).expect("first export should acquire its locks");
+        let first = acquire_export_lock(&output).expect("first export should acquire its lock");
         assert!(
-            acquire_export_locks(&output, &state).is_err(),
-            "a concurrent exporter must not read and overwrite stale state"
+            acquire_export_lock(&output).is_err(),
+            "a concurrent exporter must not overwrite an in-progress output"
         );
         drop(first);
-        acquire_export_locks(&output, &state)
-            .expect("locks should be released when the exporter exits");
+        acquire_export_lock(&output).expect("the lock should be released when the exporter exits");
+    }
+    #[test]
+    fn legacy_json_state_migrates_into_redb() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let output_path = directory.path().join("x_bookmarks.md");
+        let legacy_path = output_path.with_extension("state.json");
+        let db_path = directory.path().join("test.redb");
+
+        // Write a legacy v1 JSON sidecar next to the (absent) output file.
+        let legacy_json = serde_json::json!({
+            "version": STATE_VERSION,
+            "last_successful_sync": "2024-01-01T00:00:00+00:00",
+            "seen_tweet_ids": ["111", "222", "333"],
+            "article_titles": {"222": "Title Two"}
+        });
+        std::fs::write(&legacy_path, legacy_json.to_string())
+            .expect("legacy state should be written");
+
+        let db = BookmarksDb::open(&db_path).expect("db should open");
+        assert!(db.is_empty().expect("db starts empty"));
+
+        let migrated = migrate_legacy_state(&db, &output_path).expect("migration should succeed");
+        assert!(migrated, "migration should report success");
+
+        let ids = db.known_ids().expect("ids load");
+        assert_eq!(
+            ids,
+            HashSet::from(["111".to_string(), "222".to_string(), "333".to_string()])
+        );
+        let titles = db.article_titles().expect("titles load");
+        assert_eq!(titles.get("222").map(String::as_str), Some("Title Two"));
+
+        // The legacy JSON must be renamed to .bak and no longer present.
+        assert!(!legacy_path.exists(), "legacy file should be renamed");
+        assert!(
+            PathBuf::from(format!("{}.bak", legacy_path.display())).exists(),
+            "legacy file should be backed up"
+        );
     }
 }

@@ -1,10 +1,6 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::PathBuf,
-    time::SystemTime,
-};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 
-use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
 use clix_x_api::{ContentSubtype, ContentType};
 use serde::{Deserialize, Serialize};
@@ -65,7 +61,7 @@ pub struct BookmarksArgs {
     #[arg(long)]
     pub incremental: bool,
 
-    /// Incremental state file (default: `<output>.state.json`)
+    /// Incremental state database (default: `~/.config/clix/bookmarks.redb`)
     #[arg(long)]
     pub state: Option<PathBuf>,
 
@@ -122,28 +118,13 @@ where
     )
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Legacy JSON sidecar schema, kept only to migrate pre-redb state files.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct BookmarkState {
     pub(super) version: u32,
     pub(super) last_successful_sync: String,
     pub(super) seen_tweet_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(default)]
     pub(super) article_titles: BTreeMap<String, String>,
-}
-
-impl BookmarkState {
-    pub(super) fn new(
-        seen_tweet_ids: HashSet<String>,
-        article_titles: BTreeMap<String, String>,
-    ) -> Self {
-        let now: DateTime<Utc> = SystemTime::now().into();
-        let mut seen_tweet_ids = seen_tweet_ids.into_iter().collect::<Vec<_>>();
-        seen_tweet_ids.sort_unstable();
-        Self {
-            version: STATE_VERSION,
-            last_successful_sync: now.to_rfc3339(),
-            seen_tweet_ids,
-            article_titles,
-        }
-    }
 }

@@ -85,20 +85,26 @@ impl Settings {
     }
 }
 
-/// Resolve the config file path.
+/// Resolve the clix config directory (`~/.config/clix`).
 ///
-/// Honors `XDG_CONFIG_HOME` when set, otherwise uses `~/.config/clix/config.toml`
+/// Honors `XDG_CONFIG_HOME` when set, otherwise uses `~/.config/clix`
 /// on every platform. We intentionally avoid `dirs::config_dir()`, which
 /// diverges to `~/Library/Application Support` on macOS and would contradict
 /// the documented path in our help text and error messages.
 #[must_use]
-pub fn config_path() -> PathBuf {
+pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("clix").join("config.toml")
+    base.join("clix")
+}
+
+/// Resolve the config file path (`~/.config/clix/config.toml`).
+#[must_use]
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
 }
 
 /// Write a commented template to the config path with restrictive `0600` perms.

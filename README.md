@@ -105,16 +105,21 @@ clix-gh-stars octocat -f urls -o urls.txt
 Export your bookmarked tweets from X (Twitter) via GraphQL into Markdown, plain URL lists, or JSON files.
 
 - 🔑 **Flexible Auth:** Pass `--auth-token`/`--ct0`, declare them in `~/.config/clix/config.toml`, or set `X_AUTH_TOKEN`/`X_CT0` env vars.
+- 🗄️ **Durable State:** Incremental dedup state persists in a redb database at `~/.config/clix/bookmarks.redb` (O(1) upserts, crash-safe); legacy `<output>.state.json` files auto-migrate on first run.
+- 🔄 **Incremental Sync:** Appends newly seen bookmarks and stops after reaching previously exported IDs (`--incremental`).
 
 ##### Usage
 
 ```sh
-# Set environment variables
-export X_AUTH_TOKEN="your_auth_token"
-export X_CT0="your_ct0"
+# One-time: create and edit the config with your X credentials
+clix config init
+# then edit ~/.config/clix/config.toml → [x] auth_token / ct0
 
-# Incremental export to Markdown
+# Incremental export to Markdown (state auto-tracked in bookmarks.redb)
 clix x bookmarks --incremental -o my_bookmarks.md
+
+# Or pass credentials inline per run
+clix x bookmarks --auth-token "<token>" --ct0 "<ct0>" --incremental
 ```
 
 #### 📖 `clix x read` / `clix-x-read` — X Status and Article Reader
@@ -178,6 +183,16 @@ Each credential is resolved with the following priority (highest first):
 | 4 | **GitHub autodetect** | `gh auth token` / `gh api user` |
 
 > GitHub autodetect keeps the zero-config experience intact: leave credentials unset and clix falls back to your local `gh` CLI.
+
+### Persistent State
+
+Incremental bookmark dedup state is stored in a [redb](https://github.com/cberner/redb) key-value database at `~/.config/clix/bookmarks.redb` — crash-safe, with O(1) per-bookmark upserts instead of rewriting a whole JSON sidecar on every sync.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--state <path>` | `~/.config/clix/bookmarks.redb` | Location of the redb state database |
+
+> **Migration:** Existing `<output>.state.json` files are detected and imported into the redb store automatically on the first run; the original JSON is renamed to `<output>.state.json.bak`. No manual steps required.
 ---
 
 ## 🚀 Building & Installation

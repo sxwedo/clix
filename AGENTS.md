@@ -42,7 +42,7 @@ clix/
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-view/          # Terminal Markdown/MDX viewer
   │   ├── clix-x-api/         # Shared X auth, GraphQL parsing, and content/media types
-  │   ├── clix-x-bookmarks/   # X bookmarks exporter
+│   ├── clix-x-bookmarks/   # X bookmarks exporter (redb-backed incremental state)
   │   └── clix-x-read/        # Single X status/article reader
   └── src/main.rs             # Unified `clix` dispatcher
 ```
@@ -51,6 +51,7 @@ clix/
 
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
 - **`clix-x-api` (Shared X Infrastructure):** Owns X credentials (resolving CLI flags + config file + env vars), HTTP client setup, GraphQL parsing, media helpers, and the common content taxonomy.
+- **`clix-x-bookmarks` (Incremental State):** Dedup state persists in a redb database (`state.rs`) at `~/.config/clix/bookmarks.redb` by default; legacy JSON sidecars auto-migrate. `--state <path>.redb` overrides the location.
 - **Feature Crates:** Each user-facing tool exposes its argument type and `run` entrypoint while retaining a standalone binary.
 - **Root Binary (`clix`):** Uses `clap` to dispatch unified subcommands directly to feature crates.
 
