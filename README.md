@@ -25,7 +25,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
-- 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials.
+- 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
 - 🖼️ **Terminal Markdown Viewer (`clix md view`)**: View Markdown/MDX directly in your terminal with native high-resolution image rendering (iTerm2 / Kitty protocol).
 - 🚀 **Blazing Fast & Lightweight**: Powered by Rust 2024 and Tokio async I/O. Memory footprint under 20MB.
 
@@ -36,7 +36,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 ```text
 clix/
 ├── crates/
-│   ├── clix-core/         # Shared UI, filesystem, and GitHub config helpers
+│   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-view/         # Terminal Markdown/MDX viewer
 │   ├── clix-wx-read/      # WeChat Official Account article reader
@@ -82,8 +82,8 @@ clix wx read "https://mp.weixin.qq.com/s/abcdef123456" --format mdx --no-media
 
 Batch export all starred repositories of any GitHub user into Markdown tables, plain URL lists, or JSON files.
 
-- 🔑 **Zero-Config Auth:** Detects `GITHUB_TOKEN`, `GH_TOKEN`, or the token from `gh auth token`.
-- 👤 **User Detection:** Uses the authenticated `gh` account or an explicit `github.user`.
+- 🔑 **Flexible Auth:** `gh auth token` autodetect, explicit flags, a central config file, or `GITHUB_TOKEN`/`GH_TOKEN` env vars.
+- 👤 **User Detection:** Uses the authenticated `gh` account, an explicit `github.user`, or `git config`.
 - 🚀 **Paginated Export:** Fetches GitHub API pages asynchronously with a live progress spinner.
 
 ##### Usage
@@ -104,9 +104,7 @@ clix-gh-stars octocat -f urls -o urls.txt
 
 Export your bookmarked tweets from X (Twitter) via GraphQL into Markdown, plain URL lists, or JSON files.
 
-- 🔑 **Simple Auth:** Pass `--auth-token` and `--ct0` or set `X_AUTH_TOKEN` and `X_CT0` env vars.
-- 🔄 **Incremental Sync:** Appends newly seen bookmarks and stops after reaching previously exported IDs (`--incremental`).
-- 📊 **Metrics & Taxonomy:** Includes likes, retweets, replies, bookmarks, and quotes.
+- 🔑 **Flexible Auth:** Pass `--auth-token`/`--ct0`, declare them in `~/.config/clix/config.toml`, or set `X_AUTH_TOKEN`/`X_CT0` env vars.
 
 ##### Usage
 
@@ -142,6 +140,44 @@ clix md view article.md
 clix-view article.mdx
 ```
 
+---
+
+## ⚙️ Configuration
+
+Credentials and settings are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
+
+```sh
+clix config init   # creates ~/.config/clix/config.toml (mode 0600)
+```
+
+The generated file is self-documenting:
+
+```toml
+[github]
+# GitHub personal access token. Leave unset to fall back to `gh auth token`.
+# token = "ghp_xxxxxxxxxxxxxxxxxxxx"
+# GitHub username. Leave unset to fall back to `gh api user` / git config.
+# username = "your-name"
+
+[x]
+# X (Twitter) login cookie `auth_token`.
+# auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# X (Twitter) CSRF cookie `ct0`.
+# ct0 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+### Credential Resolution Priority
+
+Each credential is resolved with the following priority (highest first):
+
+| Priority | Source | Example |
+|:--------:|--------|---------|
+| 1 | **CLI flags** | `--token`, `--auth-token`, `--ct0` |
+| 2 | **Config file** | `~/.config/clix/config.toml` |
+| 3 | **Environment vars** | `GITHUB_TOKEN`, `X_AUTH_TOKEN`, ... |
+| 4 | **GitHub autodetect** | `gh auth token` / `gh api user` |
+
+> GitHub autodetect keeps the zero-config experience intact: leave credentials unset and clix falls back to your local `gh` CLI.
 ---
 
 ## 🚀 Building & Installation

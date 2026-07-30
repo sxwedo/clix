@@ -68,15 +68,16 @@ struct GitHubRepo {
 /// Returns an error when the username or HTTP client cannot be resolved, the
 /// GitHub API request or response fails, or the selected output cannot be
 /// rendered and written.
-pub async fn run(args: StarsArgs) -> Result<()> {
+pub async fn run(args: StarsArgs, settings: &clix_core::settings::Settings) -> Result<()> {
     validate_explicit_username(args.username.as_deref())?;
-    let Some(username) = config::resolve_username(args.username).await else {
+    let Some(username) = config::resolve_username(args.username, &settings.github).await else {
         bail!(
-            "could not detect GitHub username. Please pass it as an argument: `clix gh stars <username>`"
+            "could not detect GitHub username. Provide it via `clix gh stars <username>`, \
+             [github] username in ~/.config/clix/config.toml, or `gh auth login`."
         );
     };
 
-    let token = config::resolve_token(args.token).await;
+    let token = config::resolve_token(args.token, &settings.github).await;
 
     let output_path = args.output.unwrap_or_else(|| match args.format {
         OutputFormat::Markdown => PathBuf::from(format!("{username}_starred_repos.md")),

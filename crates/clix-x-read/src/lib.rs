@@ -68,17 +68,16 @@ struct MediaJob {
 /// Returns an error for an invalid post identifier, missing credentials,
 /// failed X requests, media-directory failures, or output serialization and
 /// write failures.
-pub async fn run(args: ReadArgs) -> Result<()> {
+pub async fn run(args: ReadArgs, settings: &clix_core::settings::Settings) -> Result<()> {
     let tweet_id = extract_tweet_id(&args.url_or_id)?;
 
-    let Some(credentials) = XCredentials::resolve(args.auth_token, args.ct0) else {
+    let Some(credentials) = XCredentials::resolve(args.auth_token, args.ct0, &settings.x) else {
         bail!(
             "Missing X authentication credentials!\n\n\
-             Please provide both credentials via CLI flags or env vars:\n  \
-             clix x read <URL> --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n\n\
-             Or set environment variables:\n  \
-             export X_AUTH_TOKEN=\"...\"\n  \
-             export X_CT0=\"...\""
+             Provide them via (highest priority first):\n  \
+             • CLI flags:  clix x read <URL> --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n  \
+             • config.toml [x] section (~/.config/clix/config.toml)\n  \
+             • env vars:   export X_AUTH_TOKEN=\"...\"; export X_CT0=\"...\""
         );
     };
 

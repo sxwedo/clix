@@ -1,3 +1,4 @@
+use anyhow::Result;
 use clap::Parser;
 use clix_core::ui;
 use clix_x_read::ReadArgs;
@@ -17,5 +18,10 @@ struct StandaloneCli {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     let cli = StandaloneCli::parse();
-    ui::exit_code(clix_x_read::run(cli.args).await)
+    ui::exit_code(try_main(cli).await)
+}
+
+async fn try_main(cli: StandaloneCli) -> Result<()> {
+    let settings = clix_core::settings::Settings::load()?;
+    clix_x_read::run(cli.args, &settings).await
 }

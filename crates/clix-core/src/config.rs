@@ -3,8 +3,15 @@ use tokio::process::Command;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn resolve_token(explicit_token: Option<String>) -> Option<String> {
+pub async fn resolve_token(
+    explicit_token: Option<String>,
+    config: &crate::settings::GitHubSettings,
+) -> Option<String> {
     if let Some(token) = nonblank(explicit_token) {
+        return Some(token);
+    }
+
+    if let Some(token) = nonblank(config.token.clone()) {
         return Some(token);
     }
 
@@ -17,9 +24,18 @@ pub async fn resolve_token(explicit_token: Option<String>) -> Option<String> {
     command_stdout("gh", &["auth", "token"]).await
 }
 
-pub async fn resolve_username(explicit_user: Option<String>) -> Option<String> {
+pub async fn resolve_username(
+    explicit_user: Option<String>,
+    config: &crate::settings::GitHubSettings,
+) -> Option<String> {
     if explicit_user.is_some() {
         return nonblank(explicit_user).filter(|user| is_valid_github_login(user));
+    }
+
+    if let Some(user) = nonblank(config.username.clone())
+        && is_valid_github_login(&user)
+    {
+        return Some(user);
     }
 
     if let Some(user) = command_stdout("gh", &["api", "user", "-q", ".login"]).await

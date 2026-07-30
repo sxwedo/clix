@@ -35,15 +35,24 @@ impl fmt::Debug for XCredentials {
 }
 
 impl XCredentials {
-    /// Resolve credentials from explicit values and supported environment variables.
+    /// Resolve credentials from explicit values, the config file, and env vars.
+    ///
+    /// Priority (highest first): explicit arguments, `config.toml`, env vars.
     #[must_use]
-    pub fn resolve(auth_token: Option<String>, ct0: Option<String>) -> Option<Self> {
+    pub fn resolve(
+        auth_token: Option<String>,
+        ct0: Option<String>,
+        config: &clix_core::settings::XSettings,
+    ) -> Option<Self> {
         let auth_token = first_nonblank(
             std::iter::once(auth_token)
+                .chain(std::iter::once(config.auth_token.clone()))
                 .chain(["X_AUTH_TOKEN", "TWITTER_AUTH_TOKEN", "AUTH_TOKEN"].map(env_value)),
         )?;
         let ct0 = first_nonblank(
-            std::iter::once(ct0).chain(["X_CT0", "TWITTER_CT0", "CT0"].map(env_value)),
+            std::iter::once(ct0)
+                .chain(std::iter::once(config.ct0.clone()))
+                .chain(["X_CT0", "TWITTER_CT0", "CT0"].map(env_value)),
         )?;
         Some(Self { auth_token, ct0 })
     }

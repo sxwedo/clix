@@ -43,6 +43,11 @@ enum Commands {
         #[command(subcommand)]
         command: MdCommands,
     },
+    /// Manage clix configuration (~/.config/clix/config.toml)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,6 +75,12 @@ enum MdCommands {
     View(ViewArgs),
 }
 
+#[derive(Debug, Clone, Copy, Subcommand)]
+enum ConfigCommands {
+    /// Create ~/.config/clix/config.toml with a commented template (mode 0600)
+    Init,
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     ui::exit_code(run(cli))
@@ -77,17 +88,24 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Gh { command } => run_async(async move {
-            match command {
-                GhCommands::Stars(args) => clix_gh_stars::run(args).await,
-            }
-        }),
-        Commands::X { command } => run_async(async move {
-            match command {
-                XCommands::Bookmarks(args) => clix_x_bookmarks::run(args).await,
-                XCommands::Read(args) => clix_x_read::run(args).await,
-            }
-        }),
+        Commands::Config { command } => run_config(command),
+        Commands::Gh { command } => {
+            let settings = clix_core::settings::Settings::load()?;
+            run_async(async move {
+                match command {
+                    GhCommands::Stars(args) => clix_gh_stars::run(args, &settings).await,
+                }
+            })
+        }
+        Commands::X { command } => {
+            let settings = clix_core::settings::Settings::load()?;
+            run_async(async move {
+                match command {
+                    XCommands::Bookmarks(args) => clix_x_bookmarks::run(args, &settings).await,
+                    XCommands::Read(args) => clix_x_read::run(args, &settings).await,
+                }
+            })
+        }
         Commands::Wx { command } => run_async(async move {
             match command {
                 WxCommands::Read(args) => clix_wx_read::run(args).await,
@@ -96,6 +114,19 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Md { command } => match command {
             MdCommands::View(args) => clix_view::run(args),
         },
+    }
+}
+
+fn run_config(command: ConfigCommands) -> Result<()> {
+    match command {
+        ConfigCommands::Init => {
+            let path = clix_core::settings::ensure_default_config()?;
+            println!(
+                "Created {} (mode 0600).\nEdit it with your credentials, then run any clix command.",
+                path.display()
+            );
+            Ok(())
+        }
     }
 }
 
