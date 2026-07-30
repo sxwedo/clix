@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
 use clix_rss_fetch::FetchArgs;
-use clix_view::ViewArgs;
 use clix_x_bookmarks::BookmarksArgs;
 use clix_x_read::ReadArgs;
 
@@ -44,11 +43,6 @@ enum Commands {
         #[command(subcommand)]
         command: WxCommands,
     },
-    /// Markdown and MDX tools
-    Md {
-        #[command(subcommand)]
-        command: MdCommands,
-    },
     /// Manage clix configuration (~/.config/clix/config.toml)
     Config {
         #[command(subcommand)]
@@ -79,12 +73,6 @@ enum XCommands {
 enum WxCommands {
     /// Download and convert a `WeChat` Official Account article URL into a local Markdown/MDX file
     Read(clix_wx_read::ReadArgs),
-}
-
-#[derive(Debug, Subcommand)]
-enum MdCommands {
-    /// View a Markdown or MDX file in the terminal
-    View(ViewArgs),
 }
 
 #[derive(Debug, Clone, Copy, Subcommand)]
@@ -131,9 +119,6 @@ fn run(cli: Cli) -> Result<()> {
                 WxCommands::Read(args) => clix_wx_read::run(args).await,
             }
         }),
-        Commands::Md { command } => match command {
-            MdCommands::View(args) => clix_view::run(args),
-        },
     }
 }
 
@@ -162,7 +147,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use clix_gh_stars::OutputFormat;
 
-    use super::{Cli, Commands, GhCommands, MdCommands, RssCommands, WxCommands};
+    use super::{Cli, Commands, GhCommands, RssCommands, WxCommands};
 
     #[test]
     fn command_tree_is_internally_consistent() {
@@ -190,19 +175,6 @@ mod tests {
             } if args.username.as_deref() == Some("octocat")
                 && args.format == OutputFormat::Json
                 && args.output.as_deref() == Some(std::path::Path::new("stars.json"))
-        ));
-    }
-
-    #[test]
-    fn parses_the_documented_markdown_view_invocation() {
-        let cli = Cli::try_parse_from(["clix", "md", "view", "article.md"])
-            .expect("documented Markdown view arguments should parse");
-
-        assert!(matches!(
-            cli.command,
-            Commands::Md {
-                command: MdCommands::View(args)
-            } if args.path == std::path::Path::new("article.md")
         ));
     }
 

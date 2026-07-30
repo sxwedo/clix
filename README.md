@@ -15,7 +15,7 @@
 
 ---
 
-`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, RSS subscription snapshots, social media content preservation, GitHub exports, WeChat article downloading, and rich terminal Markdown rendering.
+`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, RSS subscription snapshots, social media content preservation, GitHub exports, and WeChat article downloading.
 
 It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
 
@@ -27,7 +27,6 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
-- 🖼️ **Terminal Markdown Viewer (`clix md view`)**: View Markdown/MDX directly in your terminal with native high-resolution image rendering (iTerm2 / Kitty protocol).
 - 🚀 **Bounded & Efficient**: Powered by Rust 2024 and Tokio async I/O, with explicit concurrency and response-size limits on network-heavy paths.
 
 ---
@@ -40,7 +39,6 @@ clix/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-rss-fetch/    # Config-driven RSS/Atom/JSON Feed snapshot exporter
-│   ├── clix-view/         # Terminal Markdown/MDX viewer
 │   ├── clix-wx-read/      # WeChat Official Account article reader
 │   ├── clix-x-api/        # Shared X auth, GraphQL parsing, and content/media types
 │   ├── clix-x-bookmarks/  # X bookmarks exporter
@@ -189,19 +187,6 @@ clix x read https://x.com/user/status/123456789
 
 ---
 
-### 🖼️ Markdown Viewer (`clix md view`)
-
-Render a local Markdown or MDX file in the terminal with original aspect ratio image previews when using supported terminals (iTerm2 / Kitty protocol).
-
-##### Usage
-
-```sh
-clix md view article.md
-clix-view article.mdx
-```
-
----
-
 ## ⚙️ Configuration
 
 Credentials, RSS subscriptions, and fetch defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
@@ -275,7 +260,6 @@ cargo build --workspace --release
 # - clix-gh-stars      (Standalone GitHub Stars CLI)
 # - clix-x-bookmarks   (Standalone X Bookmarks CLI)
 # - clix-x-read        (Standalone X Status/Article CLI)
-# - clix-view          (Standalone Markdown/MDX viewer CLI)
 ```
 
 ---

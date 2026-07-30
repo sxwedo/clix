@@ -4,7 +4,6 @@ members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-rss-fetch",
-    "crates/clix-view",
     "crates/clix-x-api",
     "crates/clix-x-bookmarks",
     "crates/clix-x-read",
@@ -34,7 +33,6 @@ tempfile = "3.27"
 redb = "2"
 toml = "0.8"
 tokio = "1.40"
-viuer = "0.7"
 html2md = "0.2"
 scraper = "0.22"
 regex = "1.11"
@@ -55,7 +53,6 @@ clap.workspace = true
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-rss-fetch = { path = "crates/clix-rss-fetch" }
-clix-view = { path = "crates/clix-view" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }
 clix-x-read = { path = "crates/clix-x-read" }
 clix-wx-read = { path = "crates/clix-wx-read" }

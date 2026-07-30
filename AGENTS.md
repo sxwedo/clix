@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, modular CLI suite written in Rust designed to streamline daily developer tasks, GitHub workflows, social media tools, and system utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss fetch`, `clix x bookmarks`, `clix x read`, `clix wx read`, `clix md view`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss fetch`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
 - **Zero-Config GitHub Auth**: Falls back through the config file, `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`; usernames come from the config file, the authenticated `gh` account, or `github.user`.
 - **Externalized Configuration**: Credentials and RSS subscriptions live in `~/.config/clix/config.toml` (`clix config init` generates a 0600 template). Credential resolution priority: CLI flags > config file > environment variables > GitHub autodetect.
 
@@ -41,7 +41,6 @@ clix/
   │   ├── clix-core/          # Shared UI, filesystem, config loading (settings.rs), and GitHub auth helpers
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-rss-fetch/     # Config-driven RSS/Atom/JSON Feed snapshot exporter
-  │   ├── clix-view/          # Terminal Markdown/MDX viewer
   │   ├── clix-wx-read/       # WeChat Official Account article reader
   │   ├── clix-x-api/         # Shared X auth, GraphQL parsing, and content/media types
   │   ├── clix-x-bookmarks/   # X bookmarks exporter (redb-backed incremental state)
