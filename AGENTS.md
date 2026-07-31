@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, modular CLI suite written in Rust designed to streamline daily developer tasks, GitHub workflows, social media tools, and system utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss fetch`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss fetch`, `clix rss sync`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
 - **Zero-Config GitHub Auth**: Falls back through the config file, `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`; usernames come from the config file, the authenticated `gh` account, or `github.user`.
 - **Externalized Configuration**: Credentials and RSS subscriptions live in `~/.config/clix/config.toml` (`clix config init` generates a 0600 template). Credential resolution priority: CLI flags > config file > environment variables > GitHub autodetect.
 
@@ -40,7 +40,9 @@ clix/
   ├── crates/
   │   ├── clix-core/          # Shared UI, filesystem, config loading (settings.rs), and GitHub auth helpers
   │   ├── clix-gh-stars/      # GitHub stars exporter
+  │   ├── clix-rss-api/       # Shared subscription selection, bounded fetching, and normalized models
   │   ├── clix-rss-fetch/     # Config-driven RSS/Atom/JSON Feed snapshot exporter
+  │   ├── clix-rss-sync/      # Incremental normalized RSS entry store backed by redb
   │   ├── clix-wx-read/       # WeChat Official Account article reader
   │   ├── clix-x-api/         # Shared X auth, GraphQL parsing, and content/media types
   │   ├── clix-x-bookmarks/   # X bookmarks exporter (redb-backed incremental state)
@@ -51,7 +53,9 @@ clix/
 ### Key Design Points
 
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
-- **`clix-rss-fetch` (RSS Snapshot):** Keeps `lib.rs` as the public arguments/orchestration interface and separates subscription selection, bounded fetching, normalized models, and output rendering into private modules. It sanitizes active HTML, isolates per-feed failures, and atomically writes Markdown or JSON.
+- **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.
+- **`clix-rss-fetch` (RSS Snapshot):** Renders shared normalized RSS models and atomically writes Markdown or JSON snapshots.
+- **`clix-rss-sync` (RSS Incremental State):** Upserts shared normalized entries into `~/.config/clix/rss.redb` by `source_url + entry.id`. New and changed records are written transactionally, unchanged records are skipped, and disappeared entries remain as history. `--state <path>` overrides the location.
 - **`clix-x-api` (Shared X Infrastructure):** Owns X credentials (resolving CLI flags + config file + env vars), HTTP client setup, GraphQL parsing, media helpers, and the common content taxonomy.
 - **`clix-x-bookmarks` (Incremental State):** Dedup state persists in a redb database (`state.rs`) at `~/.config/clix/bookmarks.redb` by default; legacy JSON sidecars auto-migrate. `--state <path>.redb` overrides the location.
 - **Feature Crates:** Each user-facing tool exposes its argument type and `run` entrypoint while retaining a standalone binary.

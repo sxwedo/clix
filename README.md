@@ -15,7 +15,7 @@
 
 ---
 
-`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, RSS subscription snapshots, social media content preservation, GitHub exports, and WeChat article downloading.
+`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, RSS subscription snapshots and durable sync, social media content preservation, GitHub exports, and WeChat article downloading.
 
 It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
 
@@ -23,7 +23,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
-- 📰 **RSS Subscription Fetcher (`clix rss fetch`)**: Configure RSS, Atom, or JSON Feed subscriptions once and fetch their latest entries into one Markdown or JSON snapshot.
+- 📰 **RSS Tools (`clix rss`)**: Export RSS, Atom, or JSON Feed snapshots, or incrementally sync normalized entries into a durable redb database.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
@@ -38,7 +38,9 @@ clix/
 ├── crates/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
+│   ├── clix-rss-api/      # Shared RSS selection, fetching, and normalization
 │   ├── clix-rss-fetch/    # Config-driven RSS/Atom/JSON Feed snapshot exporter
+│   ├── clix-rss-sync/     # Incremental RSS entry store backed by redb
 │   ├── clix-wx-read/      # WeChat Official Account article reader
 │   ├── clix-x-api/        # Shared X auth, GraphQL parsing, and content/media types
 │   ├── clix-x-bookmarks/  # X bookmarks exporter
@@ -100,6 +102,39 @@ clix-rss-fetch --feed "Rust Blog" -o rust-news.md
 `[rss].output` is resolved from the current working directory when it is relative. `--format` takes precedence over the output extension; without `--format`, a `.json` output selects JSON and every other extension selects Markdown.
 
 Each entry contains normalized metadata, its article link, and a summary of at most 1,200 characters. The feed-provided `summary` is preferred; when it is absent, the feed-provided content body is used as the summary. This command does not crawl the linked website for the full article.
+
+#### 🔄 `clix rss sync` / `clix-rss-sync` — Incremental redb Sync
+
+Fetch the same configured subscriptions and persist their normalized entries in redb. An entry is identified by its feed `source_url` plus feed-provided `entry.id`:
+
+- a missing key is inserted;
+- an existing key whose normalized content changed is updated while preserving `first_seen_at`;
+- an unchanged key is not rewritten;
+- entries that disappear from the latest feed response remain in the database as history.
+
+The default database is `~/.config/clix/rss.redb` (or `$XDG_CONFIG_HOME/clix/rss.redb`). Override it with `[rss].state` or `--state`; CLI flags take precedence.
+
+```sh
+# Poll every enabled subscription once and sync the latest 20 entries per feed
+clix rss sync
+
+# Poll selected subscriptions with a larger lookback window
+clix rss sync --feed "Rust Blog,GitHub Blog" --limit 100
+
+# Use a separate database
+clix rss sync --state ./feeds.redb
+
+# Equivalent standalone binary
+clix-rss-sync --feed "Rust Blog"
+```
+
+`sync` performs one poll and exits; it does not stay resident. Run it manually, from cron, launchd, systemd, or another scheduler. For example, this cron entry polls every day at 08:00:
+
+```cron
+0 8 * * * /absolute/path/to/clix rss sync >> /absolute/path/to/rss-sync.log 2>&1
+```
+
+Choose the polling interval and `--limit` together. If a source publishes more than `limit` entries between two polls, older unseen entries may no longer be present in the feed and cannot be recovered by the next sync. The database stores normalized feed metadata, the article URL, and the feed-provided summary/content excerpt—not the full linked article.
 
 ---
 
@@ -213,6 +248,8 @@ The generated file is self-documenting:
 [rss]
 # Default output path. A .json extension selects JSON.
 # output = "rss.md"
+# Incremental sync database.
+# state = "/absolute/path/to/rss.redb"
 # Maximum entries retained from each feed.
 # limit = 20
 
@@ -237,13 +274,14 @@ Each credential is resolved with the following priority (highest first):
 
 ### Persistent State
 
-Incremental bookmark dedup state is stored in a [redb](https://github.com/cberner/redb) key-value database at `~/.config/clix/bookmarks.redb` — crash-safe, with O(1) per-bookmark upserts instead of rewriting a whole JSON sidecar on every sync.
+Incremental state is stored in [redb](https://github.com/cberner/redb) key-value databases with transactional writes.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--state <path>` | `~/.config/clix/bookmarks.redb` | Location of the redb state database |
+| `clix rss sync --state <path>` | `~/.config/clix/rss.redb` | Normalized RSS entry history |
+| `clix x bookmarks --state <path>` | `~/.config/clix/bookmarks.redb` | Bookmark dedup state |
 
-> **Migration:** Existing `<output>.state.json` files are detected and imported into the redb store automatically on the first run; the original JSON is renamed to `<output>.state.json.bak`. No manual steps required.
+> **Bookmark migration:** Existing `<output>.state.json` files are detected and imported into the bookmark redb store automatically on the first run; the original JSON is renamed to `<output>.state.json.bak`. No manual steps required.
 ---
 
 ## 🚀 Building & Installation
@@ -256,6 +294,7 @@ cargo build --workspace --release
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
 # - clix-rss-fetch     (Standalone RSS subscription fetcher)
+# - clix-rss-sync      (Standalone incremental RSS redb sync)
 # - clix-wx-read       (Standalone WeChat Article CLI)
 # - clix-gh-stars      (Standalone GitHub Stars CLI)
 # - clix-x-bookmarks   (Standalone X Bookmarks CLI)
