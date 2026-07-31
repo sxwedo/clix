@@ -1,0 +1,17 @@
+[package]
+name = "clix-rss-list"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "List entries stored in the clix RSS redb database."
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clix-core = { path = "../clix-core" }
+clix-rss-store = { path = "../clix-rss-store" }
+
+[dev-dependencies]
+clix-rss-api = { path = "../clix-rss-api" }
+tempfile.workspace = true

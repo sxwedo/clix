@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
 use clix_rss_fetch::FetchArgs;
+use clix_rss_list::ListArgs;
 use clix_rss_sync::SyncArgs;
 use clix_x_bookmarks::BookmarksArgs;
 use clix_x_read::ReadArgs;
@@ -61,6 +62,8 @@ enum GhCommands {
 enum RssCommands {
     /// Fetch configured subscriptions into one Markdown or JSON snapshot
     Fetch(FetchArgs),
+    /// List newest entries stored in the local redb database
+    List(ListArgs),
     /// Incrementally sync configured subscriptions into a redb database
     Sync(SyncArgs),
 }
@@ -102,12 +105,15 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Rss { command } => {
             let settings = clix_core::settings::Settings::load()?;
-            run_async(async move {
-                match command {
-                    RssCommands::Fetch(args) => clix_rss_fetch::run(args, &settings).await,
-                    RssCommands::Sync(args) => clix_rss_sync::run(args, &settings).await,
+            match command {
+                RssCommands::Fetch(args) => {
+                    run_async(async move { clix_rss_fetch::run(args, &settings).await })
                 }
-            })
+                RssCommands::List(args) => clix_rss_list::run(args, &settings),
+                RssCommands::Sync(args) => {
+                    run_async(async move { clix_rss_sync::run(args, &settings).await })
+                }
+            }
         }
         Commands::X { command } => {
             let settings = clix_core::settings::Settings::load()?;
@@ -229,6 +235,27 @@ mod tests {
             } if args.feeds == ["Rust Blog"]
                 && args.state.as_deref() == Some(std::path::Path::new("feeds.redb"))
                 && args.limit == Some(50)
+        ));
+    }
+
+    #[test]
+    fn parses_the_documented_rss_list_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "rss",
+            "list",
+            "--feed",
+            "Rust Blog",
+            "--limit",
+            "10",
+        ])
+        .expect("documented RSS list arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::List(args)
+            } if args.feeds == ["Rust Blog"] && args.limit == Some(10)
         ));
     }
 
