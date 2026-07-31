@@ -6,6 +6,7 @@
 //! 3. Environment variables (`X_AUTH_TOKEN`, `GITHUB_TOKEN`, ...)
 //! 4. GitHub autodetect via the `gh` / `git` CLIs
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,17 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"
 
+# [lark.accounts.default]
+# Lark custom app credentials.
+# app_id = \"cli_xxxxxxxxxxxxxxxx\"
+# app_secret = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"
+
+# [lark.bases.rss_news]
+# Named Base targets are reusable by RSS and future clix commands.
+# account = \"default\"
+# app_token = \"bascnxxxxxxxxxxxx\"
+# table_id = \"tblxxxxxxxxxxxx\"
+
 [rss]
 # Default output path. Relative paths are resolved from the current directory.
 # The .json extension selects JSON; every other extension defaults to Markdown.
@@ -60,6 +72,8 @@ pub struct Settings {
     #[serde(default)]
     pub x: XSettings,
     #[serde(default)]
+    pub lark: LarkSettings,
+    #[serde(default)]
     pub rss: RssSettings,
 }
 
@@ -79,6 +93,37 @@ pub struct XSettings {
     pub auth_token: Option<String>,
     #[serde(default)]
     pub ct0: Option<String>,
+}
+
+/// Named Lark accounts and Base targets shared by all Lark-backed commands.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct LarkSettings {
+    /// Named custom-app credentials.
+    #[serde(default)]
+    pub accounts: BTreeMap<String, LarkAccountSettings>,
+    /// Named Base table targets.
+    #[serde(default)]
+    pub bases: BTreeMap<String, LarkBaseSettings>,
+}
+
+/// One named Lark custom-app account.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LarkAccountSettings {
+    /// Lark custom app ID.
+    pub app_id: String,
+    /// Lark custom app secret.
+    pub app_secret: String,
+}
+
+/// One named Lark Base table.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LarkBaseSettings {
+    /// Name of the entry in `[lark.accounts]` used for authentication.
+    pub account: String,
+    /// Base app token.
+    pub app_token: String,
+    /// Base table ID.
+    pub table_id: String,
 }
 
 /// `[rss]` section: RSS subscriptions and fetch defaults.
@@ -266,6 +311,29 @@ enabled = false
         assert_eq!(settings.rss.feeds.len(), 2);
         assert!(settings.rss.feeds[0].enabled);
         assert!(!settings.rss.feeds[1].enabled);
+    }
+
+    #[test]
+    fn lark_accounts_and_bases_parse_as_reusable_named_resources() {
+        let text = r#"
+[lark.accounts.default]
+app_id = "cli_example"
+app_secret = "secret"
+
+[lark.bases.rss_news]
+account = "default"
+app_token = "bascn_example"
+table_id = "tbl_example"
+"#;
+        let settings: Settings = toml::from_str(text).expect("lark config");
+        let account = &settings.lark.accounts["default"];
+        assert_eq!(account.app_id, "cli_example");
+        assert_eq!(account.app_secret, "secret");
+
+        let base = &settings.lark.bases["rss_news"];
+        assert_eq!(base.account, "default");
+        assert_eq!(base.app_token, "bascn_example");
+        assert_eq!(base.table_id, "tbl_example");
     }
 
     #[test]

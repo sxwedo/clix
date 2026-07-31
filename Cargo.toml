@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
+    "crates/clix-lark-base",
     "crates/clix-rss-api",
     "crates/clix-rss-export",
     "crates/clix-rss-fetch",
@@ -38,6 +39,7 @@ tempfile = "3.27"
 redb = "2"
 toml = "0.8"
 tokio = "1.40"
+wiremock = "0.6.5"
 html2md = "0.2"
 scraper = "0.22"
 regex = "1.11"
