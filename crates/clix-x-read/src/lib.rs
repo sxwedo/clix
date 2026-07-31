@@ -7,15 +7,11 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
-use clix_core::{
-    fs::{atomic_write, parent_or_current},
-    ui,
-};
+use clix_core::{fs::atomic_write, ui};
+use clix_media::{MediaRequest, download_media};
 use clix_x_api::{XCredentials, build_media_client, markdown_destination, media_extension};
 
 pub use clix_x_api::{TweetDetail, fetch_tweet_detail, fetch_tweet_detail_with_options};
-
-const MAX_CONCURRENT_MEDIA_REQUESTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ReadOutputFormat {
@@ -52,13 +48,6 @@ pub struct ReadArgs {
     /// Include author and thread replies in output
     #[arg(long)]
     pub include_replies: bool,
-}
-
-struct MediaJob {
-    media_index: usize,
-    url: String,
-    destination: PathBuf,
-    relative_path: String,
 }
 
 /// Download one X post and render it in the requested local format.
@@ -206,111 +195,42 @@ async fn download_tweet_media(
     detail: &mut TweetDetail,
     output_path: &Path,
 ) -> Result<()> {
-    let base_dir = parent_or_current(output_path);
-    let media_dir = base_dir.join("media");
-    fs::create_dir_all(&media_dir).context("failed to create media directory")?;
+    let requests = detail
+        .media_urls
+        .iter()
+        .enumerate()
+        .map(|(index, media_url)| {
+            let extension = media_extension(media_url);
+            let file_name = format!(
+                "{}_{}_{}.{}",
+                detail.author_handle,
+                detail.id,
+                index + 1,
+                extension
+            );
+            MediaRequest::new(media_url, file_name)
+        })
+        .collect();
 
-    let spinner = ui::create_spinner("downloading status images...");
-    let mut downloaded = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
-    let mut available_media = Vec::new();
-    let mut jobs = Vec::new();
-
-    for (index, media_url) in detail.media_urls.iter().enumerate() {
-        let extension = media_extension(media_url);
-        let file_name = format!(
-            "{}_{}_{}.{}",
-            detail.author_handle,
-            detail.id,
-            index + 1,
-            extension
-        );
-        let destination = media_dir.join(&file_name);
-        let relative_path = format!("./media/{file_name}");
-
-        if destination.exists() {
-            skipped += 1;
-            available_media.push((index, media_url.clone(), relative_path));
-        } else {
-            jobs.push(MediaJob {
-                media_index: index,
-                url: media_url.clone(),
-                destination,
-                relative_path,
-            });
+    let available_media = download_media(
+        client,
+        output_path,
+        "downloading status images...",
+        requests,
+    )
+    .await?;
+    for available in available_media {
+        let media_url = &detail.media_urls[available.request_index];
+        if !detail.local_media.contains(&available.relative_path) {
+            detail.local_media.push(available.relative_path.clone());
+        }
+        detail.text = detail.text.replace(media_url, &available.relative_path);
+        let encoded_url = markdown_destination(media_url);
+        if encoded_url != *media_url {
+            detail.text = detail.text.replace(&encoded_url, &available.relative_path);
         }
     }
-
-    let job_count = jobs.len();
-    let mut pending = jobs.into_iter();
-    let mut tasks = tokio::task::JoinSet::new();
-    for job in pending.by_ref().take(MAX_CONCURRENT_MEDIA_REQUESTS) {
-        spawn_media_download(&mut tasks, client.clone(), job);
-    }
-
-    let mut completed = 0;
-    while let Some(joined) = tasks.join_next().await {
-        completed += 1;
-        spinner.set_message(format!(
-            "downloading status images ({completed}/{job_count})"
-        ));
-        match joined {
-            Ok((job, Ok(()))) => {
-                downloaded += 1;
-                available_media.push((job.media_index, job.url, job.relative_path));
-            }
-            Ok((job, Err(error))) => {
-                failed += 1;
-                ui::warn(format!("could not download {}: {error:#}", job.url));
-            }
-            Err(error) => {
-                failed += 1;
-                ui::warn(format!("media download task failed: {error}"));
-            }
-        }
-        if let Some(job) = pending.next() {
-            spawn_media_download(&mut tasks, client.clone(), job);
-        }
-    }
-
-    available_media.sort_unstable_by_key(|(media_index, _, _)| *media_index);
-    for (_, media_url, relative_path) in available_media {
-        if !detail.local_media.contains(&relative_path) {
-            detail.local_media.push(relative_path.clone());
-        }
-        detail.text = detail.text.replace(&media_url, &relative_path);
-        let encoded_url = markdown_destination(&media_url);
-        if encoded_url != media_url {
-            detail.text = detail.text.replace(&encoded_url, &relative_path);
-        }
-    }
-
-    spinner.finish_and_clear();
-    ui::success(format!(
-        "media: {downloaded} downloaded, {skipped} reused, {failed} failed; directory {}",
-        ui::style_bold(&media_dir.display().to_string())
-    ));
     Ok(())
-}
-
-fn spawn_media_download(
-    tasks: &mut tokio::task::JoinSet<(MediaJob, Result<()>)>,
-    client: reqwest::Client,
-    job: MediaJob,
-) {
-    tasks.spawn(async move {
-        let result = async {
-            let response = client.get(&job.url).send().await?.error_for_status()?;
-            let bytes = response.bytes().await?;
-            let destination = job.destination.clone();
-            tokio::task::spawn_blocking(move || atomic_write(&destination, &bytes))
-                .await
-                .context("media persistence task failed")?
-        }
-        .await;
-        (job, result)
-    });
 }
 
 fn write_tweet_file(detail: &TweetDetail, path: &Path, format: ReadOutputFormat) -> Result<()> {

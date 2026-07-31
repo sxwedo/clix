@@ -39,6 +39,7 @@ clix/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-lark-base/    # Reusable authenticated Lark Base upsert interface
+│   ├── clix-media/        # Bounded concurrent media download and atomic persistence
 │   ├── clix-rss-api/      # Shared RSS selection, fetching, and normalization
 │   ├── clix-rss-delivery/ # Internal reliable delivery to configured destinations
 │   ├── clix-rss-list/     # Compact terminal view of stored RSS entries
@@ -106,7 +107,7 @@ clix rss sync --no-push
 clix-rss-sync --feed "Rust Blog"
 ```
 
-When `[rss].push_to` is configured, `sync` first commits fetched entries to redb and then delivers every named destination sequentially. All destinations are attempted. A remote failure leaves the local commit intact, records the failure checkpoint, and makes the command exit unsuccessfully so a scheduler can alert or retry it.
+When `[rss].push_to` is configured, `sync` first commits fetched entries to redb and then delivers every named destination sequentially from one local archive snapshot. All destinations are attempted. A remote failure leaves the local commit intact, records the failure checkpoint, and makes the command exit unsuccessfully so a scheduler can alert or retry it.
 
 `sync` performs one poll and exits; it does not stay resident. Run it manually, from cron, launchd, systemd, or another scheduler. For example, this cron entry polls every day at 08:00:
 
@@ -169,7 +170,7 @@ Use these Lark field types:
 clix rss sync --push-to news
 ```
 
-Mapped fields are owned by the projection; an absent optional RSS value clears its mapped remote field. Unmapped Base fields are left untouched, and records are never deleted remotely. Delivery metadata is stored in the same RSS record under `extra.deliveries.<destination>`—including payload hash, target fingerprint, remote record ID, attempts, timestamps, and the latest error. A failed record remains eligible for retry, and changing the destination mapping automatically makes its checkpoint stale.
+Mapped fields are owned by the projection; an absent optional RSS value clears its mapped remote field. Unmapped Base fields are left untouched, and records are never deleted remotely. Delivery metadata is stored in the same RSS record under `extra.deliveries.<destination>`—including payload hash, target fingerprint, remote record ID, attempts, timestamps, and the latest error. Confirmed record IDs are revalidated in bounded batches of 100 instead of scanning the whole table; missing IDs automatically fall back to key-based reconciliation. A failed record remains eligible for retry, and changing the destination mapping automatically makes its checkpoint stale.
 
 Configuration and schema failures name the exact missing table, key, or Base field. For example:
 

@@ -41,6 +41,7 @@ clix/
   │   ├── clix-core/          # Shared UI, filesystem, config loading (settings.rs), and GitHub auth helpers
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-lark-base/     # Shared authenticated Lark Base schema and upsert interface
+  │   ├── clix-media/         # Bounded concurrent media download and atomic persistence
   │   ├── clix-rss-api/       # Shared subscription selection, bounded fetching, and normalized models
   │   ├── clix-rss-delivery/  # Internal reliable delivery to configured destinations
   │   ├── clix-rss-list/      # Compact terminal view of stored RSS entries
@@ -56,10 +57,11 @@ clix/
 ### Key Design Points
 
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
+- **`clix-media` (Shared Media Infrastructure):** Owns bounded concurrent downloads, per-request headers, 32 MiB response limits, local-file reuse, atomic persistence off the async executor, and best-effort failure reporting behind one batch interface.
 - **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.
-- **`clix-lark-base` (Shared Lark Infrastructure):** Owns tenant authentication, schema discovery, paginated record lookup, sequential bounded batches, transient-write retries, and create/update/unchanged planning behind one typed upsert interface.
+- **`clix-lark-base` (Shared Lark Infrastructure):** Owns tenant authentication, schema discovery, checkpoint-aware record lookup, paginated fallback reconciliation, sequential bounded batches, transient-write retries, and create/update/unchanged planning behind one typed upsert interface.
 - **`clix-rss-store` (RSS Persistence):** Hides the redb table and serialization schema behind `open`, `open_or_create`, `upsert_feeds`, `query`, and delivery checkpoint updates. Each record's extensible `extra` envelope carries per-destination delivery state while RSS refreshes preserve it.
-- **`clix-rss-delivery` (Internal RSS Delivery):** Maps canonical stored RSS fields into named destinations after a local sync. Stable entry keys, payload hashes, target fingerprints, and redb checkpoints provide idempotent retry behavior; Lark Base is the first adapter. It intentionally exposes no public CLI binary.
+- **`clix-rss-delivery` (Internal RSS Delivery):** Maps one shared snapshot of canonical stored RSS fields into configured destinations sequentially after a local sync. Stable entry keys, payload hashes, target fingerprints, and redb checkpoints provide idempotent retry behavior; Lark Base is the first adapter. It intentionally exposes no public CLI binary.
 - **`clix-rss-sync` (RSS Incremental State):** Upserts shared normalized entries into `~/.config/clix/rss.redb` by `source_url + entry.id`, then delivers `[rss].push_to` destinations after the local commit. New and changed records are written transactionally, unchanged records are skipped, and disappeared entries remain as history. `--state <path>` overrides the location.
 - **`clix-rss-list` (RSS Read View):** Reads the shared store without network access and prints a compact terminal view.
 - **`clix-x-api` (Shared X Infrastructure):** Owns X credentials (resolving CLI flags + config file + env vars), HTTP client setup, GraphQL parsing, media helpers, and the common content taxonomy.

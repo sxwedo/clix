@@ -10,6 +10,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clix-core = { path = "../clix-core" }
+clix-media = { path = "../clix-media" }
 clix-x-api = { path = "../clix-x-api" }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde_json.workspace = true

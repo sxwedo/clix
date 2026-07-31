@@ -23,6 +23,19 @@ pub struct BookmarksDb {
     db: Database,
 }
 
+/// One consistent read of every persisted bookmark and cached article title.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BookmarkSnapshot {
+    pub known_ids: HashSet<String>,
+    pub article_titles: BTreeMap<String, String>,
+}
+
+impl BookmarkSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.known_ids.is_empty()
+    }
+}
+
 impl BookmarksDb {
     /// Open or create the database at `path`, ensuring the parent directory exists.
     ///
@@ -42,72 +55,33 @@ impl BookmarksDb {
         Ok(Self { db })
     }
 
-    /// Load every seen tweet id into a set.
+    /// Load dedup IDs and cached titles in one read transaction and table scan.
     ///
     /// # Errors
     ///
     /// Returns an error when the database cannot be read.
-    pub fn known_ids(&self) -> Result<HashSet<String>> {
+    pub(crate) fn snapshot(&self) -> Result<BookmarkSnapshot> {
         let txn = self.db.begin_read()?;
         let table = match txn.open_table(BOOKMARKS_TABLE) {
             Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashSet::new()),
+            Err(redb::TableError::TableDoesNotExist(_)) => {
+                return Ok(BookmarkSnapshot::default());
+            }
             Err(error) => return Err(error.into()),
         };
-        let mut ids = HashSet::new();
-        for entry in table.iter()? {
-            let (key, _) = entry?;
-            ids.insert(key.value().to_string());
-        }
-        Ok(ids)
-    }
-
-    /// Load every cached article title (non-empty values).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the database cannot be read.
-    pub fn article_titles(&self) -> Result<BTreeMap<String, String>> {
-        let txn = self.db.begin_read()?;
-        let table = match txn.open_table(BOOKMARKS_TABLE) {
-            Ok(table) => table,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeMap::new()),
-            Err(error) => return Err(error.into()),
-        };
-        let mut titles = BTreeMap::new();
+        let mut snapshot = BookmarkSnapshot::default();
         for entry in table.iter()? {
             let (key, value) = entry?;
+            let id = key.value().to_string();
             let title = value.value();
             if !title.is_empty() {
-                titles.insert(key.value().to_string(), title.to_string());
+                snapshot
+                    .article_titles
+                    .insert(id.clone(), title.to_string());
             }
+            snapshot.known_ids.insert(id);
         }
-        Ok(titles)
-    }
-
-    /// Return the number of tracked tweets.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the database cannot be read.
-    pub fn len(&self) -> Result<usize> {
-        let txn = self.db.begin_read()?;
-        match txn.open_table(BOOKMARKS_TABLE) {
-            Ok(table) => Ok(table.iter()?.count()),
-            Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Return whether the database currently holds any state.
-    ///
-    /// Used to decide whether a legacy JSON sidecar should be migrated.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the database cannot be read.
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
+        Ok(snapshot)
     }
 
     /// Upsert a batch of `(tweet id, article title)` pairs in one transaction.
@@ -164,9 +138,9 @@ mod tests {
     #[test]
     fn empty_db_reports_no_known_ids_or_titles() {
         let db = temp_db();
-        assert!(db.is_empty().expect("is_empty"));
-        assert!(db.known_ids().expect("known_ids").is_empty());
-        assert!(db.article_titles().expect("titles").is_empty());
+        let snapshot = db.snapshot().expect("snapshot");
+        assert!(snapshot.is_empty());
+        assert!(snapshot.article_titles.is_empty());
     }
 
     #[test]
@@ -175,13 +149,13 @@ mod tests {
         db.upsert([("111", ""), ("222", "Title Two"), ("333", "")])
             .expect("upsert");
 
-        let ids = db.known_ids().expect("known_ids");
+        let snapshot = db.snapshot().expect("snapshot");
         assert_eq!(
-            ids,
+            snapshot.known_ids,
             HashSet::from(["111".into(), "222".into(), "333".into()])
         );
 
-        let titles = db.article_titles().expect("titles");
+        let titles = snapshot.article_titles;
         assert_eq!(titles.len(), 1, "only non-empty titles are returned");
         assert_eq!(titles.get("222").map(String::as_str), Some("Title Two"));
     }
@@ -192,7 +166,7 @@ mod tests {
         db.upsert([("1", "old")]).expect("upsert old");
         db.upsert([("1", "new")]).expect("upsert new");
 
-        let titles = db.article_titles().expect("titles");
+        let titles = db.snapshot().expect("snapshot").article_titles;
         assert_eq!(titles.get("1").map(String::as_str), Some("new"));
     }
 
@@ -200,10 +174,9 @@ mod tests {
     fn clear_removes_everything() {
         let db = temp_db();
         db.upsert([("1", "a"), ("2", "b")]).expect("upsert");
-        assert_eq!(db.len().expect("len"), 2);
+        assert_eq!(db.snapshot().expect("snapshot").known_ids.len(), 2);
 
         db.clear().expect("clear");
-        assert!(db.is_empty().expect("is_empty after clear"));
-        assert!(db.known_ids().expect("known_ids").is_empty());
+        assert!(db.snapshot().expect("snapshot after clear").is_empty());
     }
 }

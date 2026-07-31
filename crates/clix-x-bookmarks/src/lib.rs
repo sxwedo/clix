@@ -32,7 +32,7 @@ use output::{
 };
 #[cfg(test)]
 use output::{format_tweet_cell, markdown_status_ids_and_count, render_output};
-use state::BookmarksDb;
+use state::{BookmarkSnapshot, BookmarksDb};
 
 /// Default bookmark state database path: `~/.config/clix/bookmarks.redb`.
 fn default_state_db_path() -> PathBuf {
@@ -87,17 +87,17 @@ fn migrate_legacy_state(db: &BookmarksDb, output_path: &Path) -> Result<bool> {
 ///
 /// Existing output is folded in only for incremental runs.
 fn prepare_known_state(
-    db: &BookmarksDb,
+    snapshot: BookmarkSnapshot,
     output_path: &Path,
     format: OutputFormat,
     incremental: bool,
 ) -> Result<KnownState> {
     let mut known_ids = if incremental {
-        db.known_ids()?
+        snapshot.known_ids
     } else {
         HashSet::new()
     };
-    let mut article_titles = db.article_titles()?;
+    let mut article_titles = snapshot.article_titles;
 
     let existing_output = if output_path.exists() {
         match ExistingOutput::load(output_path, format) {
@@ -171,12 +171,13 @@ pub async fn run(args: BookmarksArgs, settings: &clix_core::settings::Settings) 
     let _output_lock = acquire_export_lock(&output_path)?;
 
     let db = BookmarksDb::open(&state_path)?;
-    if db.is_empty()? {
-        migrate_legacy_state(&db, &output_path)?;
+    let mut snapshot = db.snapshot()?;
+    if snapshot.is_empty() && migrate_legacy_state(&db, &output_path)? {
+        snapshot = db.snapshot()?;
     }
 
     let (known_ids, article_titles, existing_output) =
-        prepare_known_state(&db, &output_path, args.format, args.incremental)?;
+        prepare_known_state(snapshot, &output_path, args.format, args.incremental)?;
 
     let client = credentials.build_client()?;
 
@@ -823,10 +824,9 @@ mod tests {
             .map(|id| (id.as_str(), titles.get(id).map_or("", String::as_str)))
             .collect();
         db.upsert(entries).expect("state should be written");
-        let loaded_ids = db.known_ids().expect("ids should load");
-        let loaded_titles = db.article_titles().expect("titles should load");
-        assert_eq!(loaded_ids, output_ids);
-        assert_eq!(loaded_titles, titles);
+        let snapshot = db.snapshot().expect("snapshot should load");
+        assert_eq!(snapshot.known_ids, output_ids);
+        assert_eq!(snapshot.article_titles, titles);
         std::fs::remove_file(output_path).expect("temporary output should be removable");
         std::fs::remove_file(state_path).expect("temporary state should be removable");
     }
@@ -876,7 +876,7 @@ mod tests {
         db.upsert(std::iter::once((bookmark.id.as_str(), "Fresh API title")))
             .expect("state should be written");
 
-        let loaded_titles = db.article_titles().expect("titles should load");
+        let loaded_titles = db.snapshot().expect("snapshot should load").article_titles;
         assert_eq!(
             loaded_titles.get(&bookmark.id).map(String::as_str),
             Some("Fresh API title")
@@ -928,18 +928,20 @@ mod tests {
             .expect("legacy state should be written");
 
         let db = BookmarksDb::open(&db_path).expect("db should open");
-        assert!(db.is_empty().expect("db starts empty"));
+        assert!(db.snapshot().expect("initial snapshot").is_empty());
 
         let migrated = migrate_legacy_state(&db, &output_path).expect("migration should succeed");
         assert!(migrated, "migration should report success");
 
-        let ids = db.known_ids().expect("ids load");
+        let snapshot = db.snapshot().expect("migrated snapshot");
         assert_eq!(
-            ids,
+            snapshot.known_ids,
             HashSet::from(["111".to_string(), "222".to_string(), "333".to_string()])
         );
-        let titles = db.article_titles().expect("titles load");
-        assert_eq!(titles.get("222").map(String::as_str), Some("Title Two"));
+        assert_eq!(
+            snapshot.article_titles.get("222").map(String::as_str),
+            Some("Title Two")
+        );
 
         // The legacy JSON must be renamed to .bak and no longer present.
         assert!(!legacy_path.exists(), "legacy file should be renamed");

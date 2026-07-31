@@ -9,15 +9,12 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
-use clix_core::{
-    fs::{atomic_write, parent_or_current},
-    ui,
-};
+use clix_core::{fs::atomic_write, ui};
+use clix_media::{MediaRequest, download_media};
 use regex::Regex;
+use reqwest::header::{HeaderMap, HeaderValue, REFERER, USER_AGENT};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
-
-const MAX_CONCURRENT_MEDIA_REQUESTS: usize = 4;
 
 static TITLE_SELECTORS: LazyLock<[(Selector, bool); 3]> = LazyLock::new(|| {
     [
@@ -132,13 +129,6 @@ pub struct WxArticleDetail {
     pub markdown_body: String,
     pub media_urls: Vec<String>,
     pub local_media: Vec<String>,
-}
-
-struct MediaJob {
-    media_index: usize,
-    url: String,
-    destination: PathBuf,
-    relative_path: String,
 }
 
 /// Download one `WeChat` article and render it in the requested local format.
@@ -733,118 +723,48 @@ async fn download_article_media(
     detail: &mut WxArticleDetail,
     output_path: &Path,
 ) -> Result<()> {
-    let base_dir = parent_or_current(output_path);
-    let media_dir = base_dir.join("media");
-    fs::create_dir_all(&media_dir).context("failed to create media directory")?;
-
-    let spinner = ui::create_spinner("downloading article images...");
-    let mut downloaded = 0;
-    let mut skipped = 0;
-    let mut failed = 0;
-    let mut available_media = Vec::new();
-    let mut jobs = Vec::new();
-
     let author_slug = sanitize_filename(&detail.author);
     let id_slug = sanitize_filename(&detail.id);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        REFERER,
+        HeaderValue::from_static("https://mp.weixin.qq.com/"),
+    );
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        ),
+    );
 
-    for (index, media_url) in detail.media_urls.iter().enumerate() {
-        let extension = media_extension(media_url);
-        let file_name = format!("{author_slug}_{id_slug}_{}.{extension}", index + 1);
-        let destination = media_dir.join(&file_name);
-        let relative_path = format!("./media/{file_name}");
+    let requests = detail
+        .media_urls
+        .iter()
+        .enumerate()
+        .map(|(index, media_url)| {
+            let extension = media_extension(media_url);
+            let file_name = format!("{author_slug}_{id_slug}_{}.{extension}", index + 1);
+            MediaRequest::new(media_url, file_name).with_headers(headers.clone())
+        })
+        .collect();
 
-        if destination.exists() {
-            skipped += 1;
-            available_media.push((index, media_url.clone(), relative_path));
-        } else {
-            jobs.push(MediaJob {
-                media_index: index,
-                url: media_url.clone(),
-                destination,
-                relative_path,
-            });
+    let available_media = download_media(
+        client,
+        output_path,
+        "downloading article images...",
+        requests,
+    )
+    .await?;
+    for available in available_media {
+        let media_url = &detail.media_urls[available.request_index];
+        if !detail.local_media.contains(&available.relative_path) {
+            detail.local_media.push(available.relative_path.clone());
         }
+        detail.markdown_body = detail
+            .markdown_body
+            .replace(media_url, &available.relative_path);
     }
-
-    let job_count = jobs.len();
-    let mut pending = jobs.into_iter();
-    let mut tasks = tokio::task::JoinSet::new();
-    for job in pending.by_ref().take(MAX_CONCURRENT_MEDIA_REQUESTS) {
-        spawn_media_download(&mut tasks, client.clone(), job);
-    }
-
-    let mut completed = 0;
-    while let Some(joined) = tasks.join_next().await {
-        completed += 1;
-        spinner.set_message(format!(
-            "downloading article images ({completed}/{job_count})"
-        ));
-        match joined {
-            Ok((job, Ok(()))) => {
-                downloaded += 1;
-                available_media.push((job.media_index, job.url, job.relative_path));
-            }
-            Ok((job, Err(error))) => {
-                failed += 1;
-                ui::warn(format!("could not download {}: {error:#}", job.url));
-            }
-            Err(error) => {
-                failed += 1;
-                ui::warn(format!("media download task failed: {error}"));
-            }
-        }
-        if let Some(job) = pending.next() {
-            spawn_media_download(&mut tasks, client.clone(), job);
-        }
-    }
-
-    available_media.sort_unstable_by_key(|(media_index, _, _)| *media_index);
-    for (_, media_url, relative_path) in available_media {
-        if !detail.local_media.contains(&relative_path) {
-            detail.local_media.push(relative_path.clone());
-        }
-        detail.markdown_body = detail.markdown_body.replace(&media_url, &relative_path);
-    }
-
-    spinner.finish_and_clear();
-    ui::success(format!(
-        "media: {downloaded} downloaded, {skipped} reused, {failed} failed; directory {}",
-        ui::style_bold(&media_dir.display().to_string())
-    ));
     Ok(())
-}
-
-fn spawn_media_download(
-    tasks: &mut tokio::task::JoinSet<(MediaJob, Result<()>)>,
-    client: reqwest::Client,
-    job: MediaJob,
-) {
-    tasks.spawn(async move {
-        let result = async {
-            let bytes = client
-                .get(&job.url)
-                .header("Referer", "https://mp.weixin.qq.com/")
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                )
-                .send()
-                .await
-                .with_context(|| format!("failed to request media {}", job.url))?
-                .error_for_status()
-                .with_context(|| format!("received error response for media {}", job.url))?
-                .bytes()
-                .await
-                .with_context(|| format!("failed to download bytes for media {}", job.url))?;
-
-            atomic_write(&job.destination, &bytes)
-                .with_context(|| format!("failed to write media {}", job.destination.display()))?;
-            Ok(())
-        }
-        .await;
-
-        (job, result)
-    });
 }
 
 fn write_article_file(

@@ -120,6 +120,8 @@ impl BaseValue {
 pub struct UpsertRecord {
     pub key: String,
     pub payload_hash: String,
+    /// Previously confirmed Lark record ID, when the caller has a durable checkpoint.
+    pub remote_id: Option<String>,
     pub fields: BTreeMap<String, BaseValue>,
 }
 
@@ -129,15 +131,7 @@ pub struct UpsertRequest {
     pub target: BaseTarget,
     pub key_field: String,
     pub hash_field: String,
-    pub mode: UpsertMode,
     pub records: Vec<UpsertRecord>,
-}
-
-/// Whether an upsert should write or only return the planned actions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpsertMode {
-    Apply,
-    DryRun,
 }
 
 /// The observable action applied to one logical record.
@@ -273,15 +267,24 @@ impl LarkBaseClient {
 
         let schema = self.inspect_table(&request.target).await?;
         validate_upsert_schema(&schema, &request)?;
-        let existing = self
-            .existing_records(&request.target, &request.key_field, &request.hash_field)
-            .await?;
-        let mut plan = plan_upsert(&request, &existing);
-        if request.mode == UpsertMode::DryRun {
-            complete_dry_run(&mut plan);
+        let existing = if request
+            .records
+            .iter()
+            .all(|record| record.remote_id.is_some())
+        {
+            match self.existing_records_by_id(&request.target, &request).await {
+                Ok(KnownRecordLookup::Complete(existing)) => existing,
+                Ok(KnownRecordLookup::Stale) | Err(_) => {
+                    self.existing_records(&request.target, &request.key_field, &request.hash_field)
+                        .await?
+                }
+            }
         } else {
-            self.apply_plan(&request.target, &mut plan).await?;
-        }
+            self.existing_records(&request.target, &request.key_field, &request.hash_field)
+                .await?
+        };
+        let mut plan = plan_upsert(&request, &existing);
+        self.apply_plan(&request.target, &mut plan).await?;
         finish_report(&request.records, plan.completed)
     }
 
@@ -362,6 +365,97 @@ impl LarkBaseClient {
             }
         }
         Ok(records)
+    }
+
+    async fn existing_records_by_id(
+        &self,
+        target: &BaseTarget,
+        request: &UpsertRequest,
+    ) -> Result<KnownRecordLookup> {
+        let token = self.tenant_access_token().await?;
+        let url = format!(
+            "{}/open-apis/bitable/v1/apps/{}/tables/{}/records/batch_get",
+            self.api_base, target.app_token, target.table_id
+        );
+        let expected_by_id = request
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record
+                        .remote_id
+                        .as_deref()
+                        .expect("caller checks that every record has a remote ID"),
+                    record,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut existing = HashMap::with_capacity(request.records.len());
+
+        for batch in request.records.chunks(100) {
+            let record_ids = batch
+                .iter()
+                .filter_map(|record| record.remote_id.as_deref())
+                .collect::<Vec<_>>();
+            let response = self
+                .client
+                .post(&url)
+                .bearer_auth(&token)
+                .json(&serde_json::json!({ "record_ids": record_ids }))
+                .send()
+                .await
+                .context("failed to batch-get Lark Base records")?;
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .context("failed to read Lark Base batch-get response")?;
+            if !status.is_success() {
+                bail!("Lark Base batch-get failed with HTTP {status}: {body}");
+            }
+            let envelope: ApiEnvelope<BatchGetData> = serde_json::from_str(&body)
+                .context("failed to decode Lark Base batch-get response")?;
+            let data = envelope.into_data("batch-get Lark Base records")?;
+            if !data.forbidden_record_ids.is_empty() {
+                return Ok(KnownRecordLookup::Stale);
+            }
+            if !data.absent_record_ids.is_empty() {
+                return Ok(KnownRecordLookup::Stale);
+            }
+            for item in data.records {
+                let Some(expected) = expected_by_id.get(item.record_id.as_str()) else {
+                    bail!(
+                        "Lark Base batch-get returned unexpected record ID {}",
+                        item.record_id
+                    );
+                };
+                if item
+                    .fields
+                    .get(&request.key_field)
+                    .and_then(text_value)
+                    .as_deref()
+                    != Some(expected.key.as_str())
+                {
+                    return Ok(KnownRecordLookup::Stale);
+                }
+                let current = ExistingRecord {
+                    record_id: item.record_id,
+                    payload_hash: item.fields.get(&request.hash_field).and_then(text_value),
+                };
+                if existing.insert(expected.key.clone(), current).is_some() {
+                    bail!(
+                        "Lark Base batch-get returned duplicate record for key {}",
+                        expected.key
+                    );
+                }
+            }
+        }
+
+        if existing.len() == request.records.len() {
+            Ok(KnownRecordLookup::Complete(existing))
+        } else {
+            Ok(KnownRecordLookup::Stale)
+        }
     }
 
     async fn write_batch(
@@ -531,12 +625,21 @@ fn validate_upsert_request(request: &UpsertRequest) -> Result<()> {
         bail!("Lark Base key field and hash field must be different");
     }
     let mut keys = HashSet::new();
+    let mut remote_ids = HashSet::new();
     for record in &request.records {
         if record.key.trim().is_empty() || record.payload_hash.trim().is_empty() {
             bail!("Lark Base upsert keys and payload hashes must not be blank");
         }
         if !keys.insert(&record.key) {
             bail!("Lark Base upsert contains duplicate key `{}`", record.key);
+        }
+        if let Some(remote_id) = record.remote_id.as_deref() {
+            if remote_id.trim().is_empty() {
+                bail!("Lark Base remote record IDs must not be blank");
+            }
+            if !remote_ids.insert(remote_id) {
+                bail!("Lark Base upsert contains duplicate remote ID `{remote_id}`");
+            }
         }
         if record.fields.contains_key(&request.key_field)
             || record.fields.contains_key(&request.hash_field)
@@ -740,29 +843,6 @@ fn plan_upsert(request: &UpsertRequest, existing: &HashMap<String, ExistingRecor
     plan
 }
 
-fn complete_dry_run(plan: &mut UpsertPlan) {
-    plan.completed.extend(plan.creates.iter().map(|pending| {
-        (
-            pending.key.clone(),
-            UpsertReceipt {
-                key: pending.key.clone(),
-                remote_id: None,
-                action: UpsertAction::Created,
-            },
-        )
-    }));
-    plan.completed.extend(plan.updates.iter().map(|pending| {
-        (
-            pending.key.clone(),
-            UpsertReceipt {
-                key: pending.key.clone(),
-                remote_id: pending.remote_id.clone(),
-                action: UpsertAction::Updated,
-            },
-        )
-    }));
-}
-
 fn extend_completed(completed: &mut HashMap<String, UpsertReceipt>, receipts: Vec<UpsertReceipt>) {
     completed.extend(
         receipts
@@ -812,6 +892,21 @@ struct RecordItem {
     record_id: String,
     #[serde(default)]
     fields: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct BatchGetData {
+    #[serde(default)]
+    forbidden_record_ids: Vec<String>,
+    #[serde(default)]
+    absent_record_ids: Vec<String>,
+    #[serde(default)]
+    records: Vec<RecordItem>,
+}
+
+enum KnownRecordLookup {
+    Complete(HashMap<String, ExistingRecord>),
+    Stale,
 }
 
 #[derive(Deserialize)]
@@ -889,7 +984,7 @@ mod tests {
 
     use super::{
         BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, TableField, TableSchema,
-        UpsertAction, UpsertMode, UpsertRecord, UpsertRequest, validate_upsert_schema,
+        UpsertAction, UpsertRecord, UpsertRequest, validate_upsert_schema,
     };
 
     async fn mount_auth(server: &MockServer) {
@@ -939,6 +1034,25 @@ mod tests {
                 "code": 0,
                 "msg": "ok",
                 "data": {"has_more": false, "items": items}
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_batch_get(
+        server: &MockServer,
+        record_ids: serde_json::Value,
+        data: serde_json::Value,
+    ) {
+        Mock::given(method("POST"))
+            .and(path(
+                "/open-apis/bitable/v1/apps/app-token/tables/table-id/records/batch_get",
+            ))
+            .and(body_json(json!({"record_ids": record_ids})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "code": 0,
+                "msg": "ok",
+                "data": data
             })))
             .mount(server)
             .await;
@@ -999,10 +1113,10 @@ mod tests {
             target: target(),
             key_field: "RSS Key".to_string(),
             hash_field: "Payload Hash".to_string(),
-            mode: UpsertMode::Apply,
             records: vec![UpsertRecord {
                 key: "one".to_string(),
                 payload_hash: "hash-one".to_string(),
+                remote_id: None,
                 fields: BTreeMap::from([
                     (
                         "发布时间".to_string(),
@@ -1118,6 +1232,7 @@ mod tests {
         let record = |key: &str, hash: &str, title: &str| UpsertRecord {
             key: key.to_string(),
             payload_hash: hash.to_string(),
+            remote_id: None,
             fields: BTreeMap::from([("标题".to_string(), BaseValue::Text(title.to_string()))]),
         };
         let report = client(&server)
@@ -1125,7 +1240,6 @@ mod tests {
                 target: target(),
                 key_field: "RSS Key".to_string(),
                 hash_field: "Payload Hash".to_string(),
-                mode: UpsertMode::Apply,
                 records: vec![
                     record("same", "hash-same", "Same"),
                     record("new", "hash-new", "New"),
@@ -1197,10 +1311,10 @@ mod tests {
                 target: target(),
                 key_field: "Key".to_string(),
                 hash_field: "Hash".to_string(),
-                mode: UpsertMode::Apply,
                 records: vec![UpsertRecord {
                     key: "one".to_string(),
                     payload_hash: "hash-one".to_string(),
+                    remote_id: None,
                     fields: BTreeMap::from([(
                         "Title".to_string(),
                         BaseValue::Text("One".to_string()),
@@ -1214,7 +1328,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dry_run_validates_and_plans_without_calling_write_endpoints() {
+    async fn confirmed_remote_id_uses_bounded_lookup_instead_of_full_table_search() {
         let server = MockServer::start().await;
         mount_auth(&server).await;
         mount_fields(
@@ -1226,17 +1340,39 @@ mod tests {
             ]),
         )
         .await;
-        mount_search(&server, "Key", "Hash", json!([])).await;
+        mount_batch_get(
+            &server,
+            json!(["rec-known"]),
+            json!({
+                "forbidden_record_ids": [],
+                "absent_record_ids": [],
+                "records": [{
+                    "record_id": "rec-known",
+                    "fields": {"Key": "one", "Hash": "old-hash"}
+                }]
+            }),
+        )
+        .await;
+        mount_write(
+            &server,
+            "batch_update",
+            json!([{
+                "record_id": "rec-known",
+                "fields": {"Key": "one", "Hash": "hash-one", "Title": "One"}
+            }]),
+            "rec-known",
+        )
+        .await;
 
         let report = client(&server)
             .upsert_records(UpsertRequest {
                 target: target(),
                 key_field: "Key".to_string(),
                 hash_field: "Hash".to_string(),
-                mode: UpsertMode::DryRun,
                 records: vec![UpsertRecord {
                     key: "one".to_string(),
                     payload_hash: "hash-one".to_string(),
+                    remote_id: Some("rec-known".to_string()),
                     fields: BTreeMap::from([(
                         "Title".to_string(),
                         BaseValue::Text("One".to_string()),
@@ -1244,9 +1380,78 @@ mod tests {
                 }],
             })
             .await
-            .expect("dry run");
+            .expect("confirmed record should be updated through bounded lookup");
 
-        assert_eq!(report.created, 1);
-        assert_eq!(report.receipts[0].remote_id, None);
+        assert_eq!(report.updated, 1);
+        assert_eq!(report.receipts[0].remote_id.as_deref(), Some("rec-known"));
+    }
+
+    #[tokio::test]
+    async fn absent_checkpointed_record_falls_back_to_key_reconciliation() {
+        let server = MockServer::start().await;
+        mount_auth(&server).await;
+        mount_fields(
+            &server,
+            json!([
+                {"field_id": "fld-key", "field_name": "Key", "type": 1},
+                {"field_id": "fld-hash", "field_name": "Hash", "type": 1},
+                {"field_id": "fld-title", "field_name": "Title", "type": 1}
+            ]),
+        )
+        .await;
+        mount_batch_get(
+            &server,
+            json!(["rec-stale"]),
+            json!({
+                "forbidden_record_ids": [],
+                "absent_record_ids": ["rec-stale"],
+                "records": []
+            }),
+        )
+        .await;
+        mount_search(
+            &server,
+            "Key",
+            "Hash",
+            json!([{
+                "record_id": "rec-replacement",
+                "fields": {"Key": "one", "Hash": "old-hash"}
+            }]),
+        )
+        .await;
+        mount_write(
+            &server,
+            "batch_update",
+            json!([{
+                "record_id": "rec-replacement",
+                "fields": {"Key": "one", "Hash": "hash-one", "Title": "One"}
+            }]),
+            "rec-replacement",
+        )
+        .await;
+
+        let report = client(&server)
+            .upsert_records(UpsertRequest {
+                target: target(),
+                key_field: "Key".to_string(),
+                hash_field: "Hash".to_string(),
+                records: vec![UpsertRecord {
+                    key: "one".to_string(),
+                    payload_hash: "hash-one".to_string(),
+                    remote_id: Some("rec-stale".to_string()),
+                    fields: BTreeMap::from([(
+                        "Title".to_string(),
+                        BaseValue::Text("One".to_string()),
+                    )]),
+                }],
+            })
+            .await
+            .expect("stale checkpoint should recover through key reconciliation");
+
+        assert_eq!(report.updated, 1);
+        assert_eq!(
+            report.receipts[0].remote_id.as_deref(),
+            Some("rec-replacement")
+        );
     }
 }

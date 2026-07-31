@@ -4,6 +4,7 @@ members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-lark-base",
+    "crates/clix-media",
     "crates/clix-rss-api",
     "crates/clix-rss-delivery",
     "crates/clix-rss-list",

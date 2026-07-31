@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 clix-core = { path = "../clix-core" }
+clix-media = { path = "../clix-media" }
 html2md.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }

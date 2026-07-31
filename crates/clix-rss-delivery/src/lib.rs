@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use clix_core::{settings::RssDestinationSettings, ui};
 use clix_lark_base::{
-    BaseFieldType, BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, UpsertMode,
-    UpsertRecord, UpsertReport, UpsertRequest,
+    BaseFieldType, BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, UpsertRecord,
+    UpsertReport, UpsertRequest,
 };
 use clix_rss_store::{DeliveryCheckpoint, DeliveryOutcome, EntryQuery, RssStore, StoredEntry};
 use fs2::FileExt as _;
@@ -22,8 +22,8 @@ use sha2::{Digest, Sha256};
 /// Entries selected for an internal destination delivery after local sync.
 #[derive(Debug, Clone)]
 pub struct DeliveryRequest {
-    /// Named entry in `[rss.destinations]`
-    pub destination: String,
+    /// Named entries in `[rss.destinations]`, attempted sequentially.
+    pub destinations: Vec<String>,
 
     /// redb database path committed by the current sync.
     pub state: PathBuf,
@@ -53,9 +53,45 @@ pub async fn deliver(
     request: DeliveryRequest,
     settings: &clix_core::settings::Settings,
 ) -> Result<()> {
-    let destination = ResolvedDestination::resolve(settings, &request.destination)?;
-    let client = LarkBaseClient::new(destination.credentials.clone())?;
-    execute(request, &destination, &client).await
+    if request.destinations.is_empty() {
+        return Ok(());
+    }
+    let state_path = request.state;
+    let _lock = acquire_delivery_lock(&state_path)?;
+    let store = RssStore::open(&state_path)?;
+    let entries = store
+        .query(&EntryQuery {
+            feeds: request.feeds,
+            since: None,
+            limit: None,
+        })?
+        .entries;
+    let mut failures = Vec::new();
+
+    for name in request.destinations {
+        let result = async {
+            let destination = ResolvedDestination::resolve(settings, &name)?;
+            let client = LarkBaseClient::new(destination.credentials.clone())?;
+            execute(&state_path, &store, &entries, &destination, &client).await
+        }
+        .await;
+        if let Err(error) = result {
+            ui::warn(format!(
+                "RSS destination {name} delivery failed after local sync: {error:#}"
+            ));
+            failures.push(format!("{name}: {error:#}"));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "RSS entries were synced locally, but {} destination delivery attempt(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
 }
 
 #[cfg(test)]
@@ -64,8 +100,21 @@ async fn deliver_with<U: BaseUpserter>(
     settings: &clix_core::settings::Settings,
     upserter: &U,
 ) -> Result<()> {
-    let destination = ResolvedDestination::resolve(settings, &request.destination)?;
-    execute(request, &destination, upserter).await
+    if request.destinations.len() != 1 {
+        bail!("delivery test adapter requires exactly one destination");
+    }
+    let destination = ResolvedDestination::resolve(settings, &request.destinations[0])?;
+    let state_path = request.state;
+    let _lock = acquire_delivery_lock(&state_path)?;
+    let store = RssStore::open(&state_path)?;
+    let entries = store
+        .query(&EntryQuery {
+            feeds: request.feeds,
+            since: None,
+            limit: None,
+        })?
+        .entries;
+    execute(&state_path, &store, &entries, &destination, upserter).await
 }
 
 struct ResolvedDestination {
@@ -162,20 +211,13 @@ impl ResolvedDestination {
 }
 
 async fn execute<U: BaseUpserter>(
-    request: DeliveryRequest,
+    state_path: &Path,
+    store: &RssStore,
+    entries: &[StoredEntry],
     destination: &ResolvedDestination,
     upserter: &U,
 ) -> Result<()> {
-    let state_path = request.state;
-    let _lock = acquire_delivery_lock(&state_path)?;
-    let store = RssStore::open(&state_path)?;
-    let result = store.query(&EntryQuery {
-        feeds: request.feeds,
-        since: None,
-        limit: None,
-    })?;
-    let prepared = result
-        .entries
+    let prepared = entries
         .iter()
         .map(|entry| prepare_entry(entry, destination))
         .collect::<Result<Vec<_>>>()?
@@ -206,7 +248,6 @@ async fn execute<U: BaseUpserter>(
         target: destination.target.clone(),
         key_field: destination.key_field.clone(),
         hash_field: destination.hash_field.clone(),
-        mode: UpsertMode::Apply,
         records: prepared
             .iter()
             .map(|prepared| prepared.record.clone())
@@ -238,8 +279,8 @@ async fn execute<U: BaseUpserter>(
         }
     };
 
-    persist_successes(&store, &prepared, destination, &attempted_at, &report)?;
-    print_report(destination, &state_path, &report);
+    persist_successes(store, &prepared, destination, &attempted_at, &report)?;
+    print_report(destination, state_path, &report);
     Ok(())
 }
 
@@ -259,11 +300,18 @@ fn prepare_entry<'a>(
         }
     }
     let payload_hash = hash_value(&fields)?;
+    let remote_id = entry
+        .delivery_state(&destination.name)
+        .filter(|state| {
+            state.kind == "lark_base" && state.target_fingerprint == destination.target_fingerprint
+        })
+        .and_then(|state| state.remote_id.clone());
     Ok(PreparedEntry {
         stored: entry,
         record: UpsertRecord {
             key: entry.storage_key(),
             payload_hash,
+            remote_id,
             fields,
         },
     })
@@ -695,6 +743,39 @@ title = "标题"
     }
 
     #[tokio::test]
+    async fn changed_entry_reuses_its_checkpointed_remote_id() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("rss.redb");
+        RssStore::open_or_create(&state)
+            .expect("store")
+            .upsert_feeds(&[feed()], "2026-07-31T01:00:00Z")
+            .expect("seed");
+        let settings = settings(&state);
+        let upserter = RecordingUpserter {
+            requests: Mutex::new(Vec::new()),
+        };
+
+        deliver_with(delivery_request(&state), &settings, &upserter)
+            .await
+            .expect("first delivery");
+        let mut changed = feed();
+        changed.entries[0].title = "Changed".to_string();
+        RssStore::open(&state)
+            .expect("reopen")
+            .upsert_feeds(&[changed], "2026-07-31T02:00:00Z")
+            .expect("refresh");
+        deliver_with(delivery_request(&state), &settings, &upserter)
+            .await
+            .expect("changed delivery");
+
+        let requests = upserter.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].records[0].remote_id, None);
+        assert_eq!(requests[1].records[0].remote_id.as_deref(), Some("rec-0"));
+        drop(requests);
+    }
+
+    #[tokio::test]
     async fn failed_delivery_is_checkpointed_and_remains_eligible_for_retry() {
         let directory = tempfile::tempdir().expect("temp dir");
         let state = directory.path().join("rss.redb");
@@ -777,6 +858,32 @@ title = "标题"
         );
     }
 
+    #[tokio::test]
+    async fn every_destination_is_attempted_and_configuration_failures_are_aggregated() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("rss.redb");
+        RssStore::open_or_create(&state)
+            .expect("store")
+            .upsert_feeds(&[feed()], "2026-07-31T01:00:00Z")
+            .expect("seed");
+
+        let error = deliver(
+            DeliveryRequest {
+                destinations: vec!["missing_one".to_string(), "missing_two".to_string()],
+                state,
+                feeds: Vec::new(),
+            },
+            &clix_core::settings::Settings::default(),
+        )
+        .await
+        .expect_err("both missing destinations should be reported");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("2 destination delivery attempt(s) failed"));
+        assert!(message.contains("missing_one:"));
+        assert!(message.contains("missing_two:"));
+    }
+
     fn settings(state: &Path) -> clix_core::settings::Settings {
         toml::from_str(&format!(
             r#"
@@ -808,7 +915,7 @@ title = "标题"
 
     fn delivery_request(state: &Path) -> DeliveryRequest {
         DeliveryRequest {
-            destination: "news".to_string(),
+            destinations: vec!["news".to_string()],
             state: state.to_path_buf(),
             feeds: Vec::new(),
         }

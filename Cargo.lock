@@ -299,6 +299,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "clix-media"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clix-core",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "clix-rss-api"
 version = "0.1.0"
 dependencies = [
@@ -380,6 +392,7 @@ dependencies = [
  "chrono",
  "clap",
  "clix-core",
+ "clix-media",
  "html2md",
  "regex",
  "reqwest",
@@ -410,6 +423,7 @@ dependencies = [
  "chrono",
  "clap",
  "clix-core",
+ "clix-media",
  "clix-x-api",
  "fs2",
  "redb",
@@ -427,6 +441,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clix-core",
+ "clix-media",
  "clix-x-api",
  "reqwest",
  "serde_json",
