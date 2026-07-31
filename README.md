@@ -23,7 +23,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
-- 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect the local archive, and export it to Markdown or JSON.
+- 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect or export the local archive, and reliably project it into Lark Base.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
@@ -38,12 +38,14 @@ clix/
 ├── crates/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
+│   ├── clix-lark-base/    # Reusable authenticated Lark Base upsert interface
 │   ├── clix-rss-api/      # Shared RSS selection, fetching, and normalization
 │   ├── clix-rss-export/   # Local redb archive to Markdown/JSON exporter
 │   ├── clix-rss-fetch/    # Config-driven RSS/Atom/JSON Feed snapshot exporter
 │   ├── clix-rss-list/     # Compact terminal view of stored RSS entries
+│   ├── clix-rss-push/     # Reliable projection of stored entries to named destinations
 │   ├── clix-rss-store/    # Shared redb persistence and archive querying
-│   ├── clix-rss-sync/     # Incremental RSS entry store backed by redb
+│   ├── clix-rss-sync/     # Fetch, local redb commit, and configured remote delivery
 │   ├── clix-wx-read/      # WeChat Official Account article reader
 │   ├── clix-x-api/        # Shared X auth, GraphQL parsing, and content/media types
 │   ├── clix-x-bookmarks/  # X bookmarks exporter
@@ -127,9 +129,17 @@ clix rss sync --feed "Rust Blog,GitHub Blog" --limit 100
 # Use a separate database
 clix rss sync --state ./feeds.redb
 
+# Push only to explicitly selected destinations after the local sync
+clix rss sync --push-to news,archive
+
+# Commit locally without running configured remote deliveries
+clix rss sync --no-push
+
 # Equivalent standalone binary
 clix-rss-sync --feed "Rust Blog"
 ```
+
+When `[rss].push_to` is configured, `sync` first commits fetched entries to redb and then pushes every named destination sequentially. All destinations are attempted. A remote failure leaves the local commit intact, records an actionable error where possible, and makes the command exit unsuccessfully so a scheduler can alert or retry it.
 
 `sync` performs one poll and exits; it does not stay resident. Run it manually, from cron, launchd, systemd, or another scheduler. For example, this cron entry polls every day at 08:00:
 
@@ -138,6 +148,72 @@ clix-rss-sync --feed "Rust Blog"
 ```
 
 Choose the polling interval and `--limit` together. If a source publishes more than `limit` entries between two polls, older unseen entries may no longer be present in the feed and cannot be recovered by the next sync. The database stores normalized feed metadata, the article URL, and the feed-provided summary/content excerpt—not the full linked article.
+
+#### 🚚 `clix rss push` / `clix-rss-push` — Reliable Remote Delivery
+
+Project entries already stored in redb into a named destination. The first supported destination is Lark Base; the Lark account and Base definitions are shared infrastructure that future clix commands can reuse.
+
+Create the required fields in a Base table, grant the custom app access to that Base, and configure it:
+
+```toml
+[lark.accounts.default]
+app_id = "cli_xxxxxxxxxxxxxxxx"
+app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[lark.bases.rss_news]
+account = "default"
+app_token = "bascnxxxxxxxxxxxx"
+table_id = "tblxxxxxxxxxxxx"
+
+[rss]
+state = "/absolute/path/to/rss.redb"
+push_to = ["news"]
+
+[rss.destinations.news]
+type = "lark_base"
+base = "rss_news"
+key_field = "RSS Key"
+hash_field = "Payload Hash"
+
+[rss.destinations.news.fields]
+title = "标题"
+url = "原文链接"
+subscription = "订阅源"
+source_url = "Feed 地址"
+entry_id = "Entry ID"
+published_at = "发布时间"
+authors = "作者"
+categories = "分类"
+summary = "摘要"
+first_seen_at = "首次发现时间"
+```
+
+Use these Lark field types:
+
+| Destination field | Lark Base type |
+|---|---|
+| `key_field`, `hash_field`, title, subscription, entry ID, summary | Text |
+| entry URL, source URL, site URL | URL |
+| publication, first-seen, and feed-update times | Date |
+| authors and categories | Multi-select |
+
+`key_field` must not contain duplicate values in existing remote records. The client uses the stable local key (`source_url + entry.id`) and the managed payload hash to choose create, update, or unchanged without making callers understand Lark API details.
+
+```sh
+# Inspect schema and planned creates/updates without remote writes or checkpoints
+clix rss push news --dry-run --force
+
+# Push only entries whose successful local checkpoint is absent or stale
+clix rss push news
+
+# Reconcile every matching entry against the current remote table
+clix rss push news --force
+
+# Limit the local projection
+clix rss push news --feed "Rust Blog" --limit 100
+```
+
+Mapped fields are owned by the projection; an absent optional RSS value clears its mapped remote field. Unmapped Base fields are left untouched, and records are never deleted remotely. Delivery metadata is stored in the same RSS record under `extra.deliveries.<destination>`—including payload hash, target fingerprint, remote record ID, attempts, timestamps, and the latest error. A failed record remains eligible for retry, and changing the destination mapping automatically makes its checkpoint stale.
 
 #### 📚 `clix rss list` / `clix-rss-list` — Local Archive View
 
@@ -185,7 +261,7 @@ clix rss list
 clix rss export --since 7d -o weekly-rss.md
 ```
 
-Use `clix rss fetch` only for a one-off live snapshot that should not read or update the archive.
+Use `clix rss fetch` only for a one-off live snapshot that should not read or update the archive. Use `clix rss export --format json` when you need to inspect the complete stored records and their `extra.deliveries` state.
 
 ---
 
@@ -296,6 +372,15 @@ The generated file is self-documenting:
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
+# [lark.accounts.default]
+# app_id = "cli_xxxxxxxxxxxxxxxx"
+# app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# [lark.bases.rss_news]
+# account = "default"
+# app_token = "bascnxxxxxxxxxxxx"
+# table_id = "tblxxxxxxxxxxxx"
+
 [rss]
 # Default output path. A .json extension selects JSON.
 # output = "rss.md"
@@ -303,11 +388,31 @@ The generated file is self-documenting:
 # state = "/absolute/path/to/rss.redb"
 # Maximum entries retained from each feed.
 # limit = 20
+# Destinations automatically pushed after a successful local sync.
+# push_to = ["news"]
 
 # [[rss.feeds]]
 # name = "Rust Blog"
 # url = "https://blog.rust-lang.org/feed.xml"
 # enabled = true
+
+# [rss.destinations.news]
+# type = "lark_base"
+# base = "rss_news"
+# key_field = "RSS Key"
+# hash_field = "Payload Hash"
+#
+# [rss.destinations.news.fields]
+# title = "标题"
+# url = "原文链接"
+# subscription = "订阅源"
+# source_url = "Feed 地址"
+# entry_id = "Entry ID"
+# published_at = "发布时间"
+# authors = "作者"
+# categories = "分类"
+# summary = "摘要"
+# first_seen_at = "首次发现时间"
 ```
 
 ### Credential Resolution Priority
@@ -325,7 +430,7 @@ Each credential is resolved with the following priority (highest first):
 
 ### Persistent State
 
-Incremental state is stored in [redb](https://github.com/cberner/redb) key-value databases with transactional writes. RSS `list` and `export` open the existing database read-only at the command level and never create a missing archive silently.
+Incremental state is stored in [redb](https://github.com/cberner/redb) key-value databases with transactional writes. RSS delivery checkpoints live in the extensible `extra` object of each existing entry rather than a second table. RSS `list` and `export` open the existing database read-only at the command level and never create a missing archive silently.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -347,7 +452,8 @@ cargo build --workspace --release
 # - clix-rss-export    (Standalone local RSS archive exporter)
 # - clix-rss-fetch     (Standalone RSS subscription fetcher)
 # - clix-rss-list      (Standalone local RSS archive list)
-# - clix-rss-sync      (Standalone incremental RSS redb sync)
+# - clix-rss-push      (Standalone remote RSS delivery)
+# - clix-rss-sync      (Standalone RSS redb sync and configured delivery)
 # - clix-wx-read       (Standalone WeChat Article CLI)
 # - clix-gh-stars      (Standalone GitHub Stars CLI)
 # - clix-x-bookmarks   (Standalone X Bookmarks CLI)

@@ -8,7 +8,7 @@ use clix_rss_sync::SyncArgs;
     name = "clix-rss-sync",
     author,
     version,
-    about = "🔄 Incrementally sync configured RSS subscriptions into redb."
+    about = "🔄 Sync configured RSS subscriptions into redb and remote destinations."
 )]
 struct StandaloneCli {
     #[command(flatten)]

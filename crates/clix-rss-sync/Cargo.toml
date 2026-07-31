@@ -3,7 +3,7 @@ name = "clix-rss-sync"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Incrementally sync configured RSS subscriptions into redb."
+description = "Sync configured RSS subscriptions into redb and configured destinations."
 license.workspace = true
 
 [dependencies]
@@ -12,6 +12,7 @@ chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
 clix-core = { path = "../clix-core" }
 clix-rss-api = { path = "../clix-rss-api" }
+clix-rss-push = { path = "../clix-rss-push" }
 clix-rss-store = { path = "../clix-rss-store" }
 tokio = { workspace = true, features = ["macros", "rt"] }
 

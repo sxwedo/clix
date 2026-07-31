@@ -7,7 +7,7 @@ use std::{
 use clix_core::settings::{RssFeedSettings, RssSettings};
 use clix_rss_store::{EntryQuery, RssStore};
 
-use crate::{SyncArgs, run};
+use crate::{SyncArgs, run, select_push_destinations};
 
 const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -57,6 +57,7 @@ async fn configured_subscription_syncs_into_redb_and_deduplicates_next_poll() {
                 url: source_url.clone(),
                 enabled: true,
             }],
+            ..RssSettings::default()
         },
         ..clix_core::settings::Settings::default()
     };
@@ -67,6 +68,8 @@ async fn configured_subscription_syncs_into_redb_and_deduplicates_next_poll() {
                 feeds: Vec::new(),
                 state: None,
                 limit: None,
+                push_to: Vec::new(),
+                no_push: false,
             },
             &settings,
         )
@@ -82,4 +85,80 @@ async fn configured_subscription_syncs_into_redb_and_deduplicates_next_poll() {
     assert_eq!(stored.source_url, source_url);
     assert_eq!(stored.subscription, "Local");
     assert_eq!(stored.entry.title, "Entry One");
+}
+
+#[test]
+fn explicit_push_destinations_override_config_and_no_push_wins() {
+    let mut settings = clix_core::settings::Settings::default();
+    settings.rss.push_to = vec!["configured".to_string()];
+    let mut args = SyncArgs {
+        feeds: Vec::new(),
+        state: None,
+        limit: None,
+        push_to: vec!["manual".to_string(), "manual".to_string()],
+        no_push: false,
+    };
+
+    assert_eq!(
+        select_push_destinations(&args, &settings),
+        ["manual".to_string()]
+    );
+
+    args.no_push = true;
+    assert!(select_push_destinations(&args, &settings).is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_sync_stays_committed_when_configured_push_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
+    let address = listener.local_addr().expect("listener address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request");
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).expect("read request");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            RSS_FIXTURE.len(),
+            RSS_FIXTURE
+        )
+        .expect("write response");
+    });
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let state_path = directory.path().join("rss.redb");
+    let source_url = format!("http://{address}/feed.xml");
+    let mut settings = clix_core::settings::Settings::default();
+    settings.rss.state = Some(state_path.clone());
+    settings.rss.push_to = vec!["missing".to_string()];
+    settings.rss.feeds.push(RssFeedSettings {
+        name: "Local".to_string(),
+        url: source_url,
+        enabled: true,
+    });
+
+    let error = run(
+        SyncArgs {
+            feeds: Vec::new(),
+            state: None,
+            limit: None,
+            push_to: Vec::new(),
+            no_push: false,
+        },
+        &settings,
+    )
+    .await
+    .expect_err("unknown configured destination should fail");
+    server.join().expect("server should finish");
+
+    assert!(
+        error
+            .to_string()
+            .contains("unknown RSS destination `missing`")
+    );
+    let result = RssStore::open(&state_path)
+        .expect("local sync should already be committed")
+        .query(&EntryQuery::default())
+        .expect("query entries");
+    assert_eq!(result.database_entries, 1);
 }

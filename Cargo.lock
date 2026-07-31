@@ -400,6 +400,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-rss-api",
+ "clix-rss-push",
  "clix-rss-store",
  "tempfile",
  "tokio",

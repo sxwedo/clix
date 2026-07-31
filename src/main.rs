@@ -70,7 +70,7 @@ enum RssCommands {
     List(ListArgs),
     /// Push stored entries to a configured remote destination
     Push(PushArgs),
-    /// Incrementally sync configured subscriptions into a redb database
+    /// Sync configured subscriptions into redb and configured destinations
     Sync(SyncArgs),
 }
 
@@ -263,6 +263,8 @@ mod tests {
             "feeds.redb",
             "--limit",
             "50",
+            "--push-to",
+            "news,archive",
         ])
         .expect("documented RSS sync arguments should parse");
 
@@ -273,6 +275,21 @@ mod tests {
             } if args.feeds == ["Rust Blog"]
                 && args.state.as_deref() == Some(std::path::Path::new("feeds.redb"))
                 && args.limit == Some(50)
+                && args.push_to == ["news", "archive"]
+                && !args.no_push
+        ));
+    }
+
+    #[test]
+    fn parses_rss_sync_no_push_override() {
+        let cli = Cli::try_parse_from(["clix", "rss", "sync", "--no-push"])
+            .expect("RSS sync no-push override should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::Sync(args)
+            } if args.no_push
         ));
     }
 

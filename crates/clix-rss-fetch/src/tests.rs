@@ -161,6 +161,7 @@ fn subscription_selection_honors_enabled_names_and_validates_duplicates() {
                 enabled: false,
             },
         ],
+        ..RssSettings::default()
     };
     let selected = select_subscriptions(&settings, &["one".to_string()])
         .expect("case-insensitive selection should work");
@@ -228,6 +229,7 @@ async fn configured_subscription_fetches_and_writes_json_end_to_end() {
                 url: format!("http://{address}/feed.xml"),
                 enabled: true,
             }],
+            ..RssSettings::default()
         },
         ..clix_core::settings::Settings::default()
     };
