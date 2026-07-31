@@ -297,6 +297,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clix-rss-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clix-core",
+ "clix-rss-api",
+ "redb",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "clix-rss-sync"
 version = "0.1.0"
 dependencies = [
@@ -305,9 +319,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-rss-api",
- "redb",
- "serde",
- "serde_json",
+ "clix-rss-store",
  "tempfile",
  "tokio",
 ]

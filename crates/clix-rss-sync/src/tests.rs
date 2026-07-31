@@ -5,8 +5,9 @@ use std::{
 };
 
 use clix_core::settings::{RssFeedSettings, RssSettings};
+use clix_rss_store::{EntryQuery, RssStore};
 
-use crate::{SyncArgs, run, state::RssDb};
+use crate::{SyncArgs, run};
 
 const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0">
@@ -74,12 +75,11 @@ async fn configured_subscription_syncs_into_redb_and_deduplicates_next_poll() {
     }
     server.join().expect("server should finish");
 
-    let database = RssDb::open(&state_path).expect("reopen synced database");
-    assert_eq!(database.len().expect("entry count"), 1);
-    let stored = database
-        .get(&source_url, "entry-one")
-        .expect("read entry")
-        .expect("stored entry");
+    let store = RssStore::open(&state_path).expect("reopen synced database");
+    let result = store.query(&EntryQuery::default()).expect("query entries");
+    assert_eq!(result.database_entries, 1);
+    let stored = &result.entries[0];
+    assert_eq!(stored.source_url, source_url);
     assert_eq!(stored.subscription, "Local");
     assert_eq!(stored.entry.title, "Entry One");
 }

@@ -1,19 +1,19 @@
 [package]
-name = "clix-rss-sync"
+name = "clix-rss-store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Incrementally sync configured RSS subscriptions into redb."
+description = "Shared persistent RSS entry store backed by redb."
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-chrono = { workspace = true, features = ["clock"] }
-clap.workspace = true
+chrono.workspace = true
 clix-core = { path = "../clix-core" }
 clix-rss-api = { path = "../clix-rss-api" }
-clix-rss-store = { path = "../clix-rss-store" }
-tokio = { workspace = true, features = ["macros", "rt"] }
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
