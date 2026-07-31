@@ -1,0 +1,21 @@
+[package]
+name = "clix-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Local-first process and session control for developer agents."
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+chrono.workspace = true
+clix-core = { path = "../clix-core" }
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+unicode-width.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

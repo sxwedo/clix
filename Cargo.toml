@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/clix-agent",
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-lark-base",
@@ -44,20 +45,23 @@ wiremock = "0.6.5"
 html2md = "0.2"
 scraper = "0.22"
 regex = "1.11"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+unicode-width = "0.2"
 
 [package]
 name = "clix"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "CLI Extensions for daily developer superpowers."
+description = "A fast, local-first control plane for developer agents."
 license.workspace = true
 readme = "README.md"
-keywords = ["cli", "developer-tools", "github", "twitter", "utility"]
+keywords = ["cli", "developer-tools", "agents", "automation", "local-first"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+clix-agent = { path = "crates/clix-agent" }
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-rss-list = { path = "crates/clix-rss-list" }

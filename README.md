@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Blazing-Fast Developer Superpower CLI Suite written in Rust.</strong>
+  <strong>A fast, local-first control plane for developer agents.</strong>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 
 ---
 
-`clix` is a modular, high-performance CLI suite written in Rust designed to empower daily developer workflows, durable RSS sync, social media content preservation, GitHub exports, and WeChat article downloading.
+`clix` discovers, inspects, and controls developer agents running on your machine. Its local-first core is complemented by durable RSS sync, GitHub exports, and focused content-preservation tools.
 
 It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
 
@@ -23,6 +23,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
+- 🤖 **Agent Control (`clix agent`)**: Discover Claude Code, Codex, Gemini CLI, OpenCode, Pi, Cursor Agent, and configured custom agents; inspect processes and local sessions, tail logs, watch resources, stop a process safely, or resume a saved session.
 - 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect the local archive, and reliably deliver new or changed entries into Lark Base.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
@@ -37,6 +38,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 clix/
 ├── crates/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
+│   ├── clix-agent/        # Local agent process discovery, session inspection, and control
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-lark-base/    # Reusable authenticated Lark Base upsert interface
 │   ├── clix-media/        # Bounded concurrent media download and atomic persistence
@@ -55,6 +57,61 @@ clix/
 ---
 
 ## ✨ Available Tools
+
+### 🤖 Agent Control (`clix agent`)
+
+`clix agent` is a local process and session control layer. It does not require a daemon and does not upload process or conversation data. Built-in adapters recognize Claude Code, Codex, Gemini CLI, OpenCode, Pi, and the Cursor Agent CLI.
+
+```sh
+# List running agents. The ID column is accepted by inspect, logs, and stop.
+clix agent ps
+clix agent ps --json
+
+# Refresh CPU and memory continuously; pipes/non-terminals render once.
+clix agent top
+clix agent top --interval 3 --iterations 5
+
+# Inspect a live process or an archived session.
+clix agent inspect codex:12345
+clix agent inspect codex:019abcde-session-id
+
+# Show a compact, one-line event tail; opt into original JSONL records.
+clix agent logs claude:session-id -n 100
+clix agent logs claude:session-id -n 20 --raw
+
+# SIGTERM after PID/start-time/type revalidation; --force uses a forceful kill.
+clix agent stop claude:12345
+clix agent stop claude:12345 --force
+
+# Resume through the provider's native CLI, without invoking a shell.
+clix agent resume codex:session-id
+clix agent resume cursor:chat-id
+```
+
+The process table exposes `ID`, `AGENT`, `PROJECT`, `STATUS`, `DURATION`, `TOKENS`, and `COST`; `top` adds CPU and memory. Status is derived from the operating system process state. Token and cost values remain `-` when clix cannot reliably associate a running process with one local session. Inspecting a specific archived session calculates usage from that provider's persisted usage fields; cost is shown only when the provider stored an exact value.
+
+Session metadata and logs are read from each provider's native local store. Indexing is lazy: clix reads lightweight metadata first and calculates token/cost usage only for the selected session. `logs` bounds individual record size and its retained tail, while `--raw` deliberately exposes the original selected records.
+
+Custom agents use exact executable names plus optional argv markers. The resume command is an argv array with a required `{session}` placeholder, so it never passes configuration through a shell:
+
+```toml
+[agent.custom.my_agent]
+executables = ["my-agent", "my-agent.exe"]
+command_contains = ["--agent-mode"]
+resume = ["my-agent", "resume", "{session}"]
+```
+
+Then use the same stable selectors:
+
+```sh
+clix agent inspect my_agent:12345
+clix agent stop my_agent:12345
+clix agent resume my_agent:session-id
+```
+
+Custom process discovery, stop, and resume are supported. Custom archived-session inspection and logs require a future session-store adapter and therefore fail with an explicit message rather than guessing a path.
+
+---
 
 ### 📰 RSS Utilities (`clix rss`)
 
@@ -295,7 +352,7 @@ clix x read https://x.com/user/status/123456789
 
 ## ⚙️ Configuration
 
-Credentials, RSS subscriptions, and sync defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
+Custom Agent definitions, credentials, RSS subscriptions, and sync defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
 
 ```sh
 clix config init   # creates ~/.config/clix/config.toml (mode 0600)
@@ -315,6 +372,11 @@ The generated file is self-documenting:
 # auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# [agent.custom.my_agent]
+# executables = ["my-agent"]
+# command_contains = ["--agent-mode"]
+# resume = ["my-agent", "resume", "{session}"]
 
 # [lark.accounts.default]
 # app_id = "cli_xxxxxxxxxxxxxxxx"
@@ -391,6 +453,7 @@ cargo build --workspace --release
 
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
+# - clix-agent         (Standalone local developer-agent control)
 # - clix-rss-list      (Standalone local RSS archive list)
 # - clix-rss-sync      (Standalone RSS redb sync and configured delivery)
 # - clix-wx-read       (Standalone WeChat Article CLI)
