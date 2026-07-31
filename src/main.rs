@@ -180,7 +180,20 @@ mod tests {
             ],
             vec!["clix", "agent", "inspect", "codex:42"],
             vec!["clix", "agent", "logs", "session-id", "-n", "20"],
+            vec!["clix", "agent", "sessions"],
+            vec![
+                "clix",
+                "agent",
+                "sessions",
+                "--provider",
+                "claude",
+                "--limit",
+                "10",
+                "--json",
+            ],
             vec!["clix", "agent", "stop", "claude:42"],
+            vec!["clix", "agent", "resume"],
+            vec!["clix", "agent", "resume", "--list"],
             vec!["clix", "agent", "resume", "gemini:session-id"],
         ] {
             let cli = Cli::try_parse_from(&invocation)

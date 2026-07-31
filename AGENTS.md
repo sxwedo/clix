@@ -57,7 +57,7 @@ clix/
 
 ### Key Design Points
 
-- **`clix-agent` (Local Agent Control):** Recognizes built-in and configured custom developer-agent processes, lazily indexes native provider session stores, reports only persisted token/cost data, revalidates process identity before termination, and resumes sessions with native argv without a shell.
+- **`clix-agent` (Local Agent Control):** Recognizes built-in (including Pi and Oh My Pi) and configured custom developer-agent processes, lists native provider sessions independently of live processes, associates live processes with persisted project/usage data, provides interactive top and resume pickers, reports only persisted token/cost data, revalidates process identity before termination, and resumes sessions with native argv without a shell.
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
 - **`clix-media` (Shared Media Infrastructure):** Owns bounded concurrent downloads, per-request headers, 32 MiB response limits, local-file reuse, atomic persistence off the async executor, and best-effort failure reporting behind one batch interface.
 - **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.

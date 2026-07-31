@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,48 @@ pub struct SessionCatalog {
     sessions: Vec<AgentSession>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CachedUsage {
+    updated_at: u64,
+    tokens: Option<u64>,
+    cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Default)]
+pub struct UsageCache {
+    entries: BTreeMap<PathBuf, CachedUsage>,
+}
+
+impl UsageCache {
+    pub fn enrich(
+        &mut self,
+        catalog: &SessionCatalog,
+        session: &AgentSession,
+    ) -> Result<AgentSession> {
+        if let Some(cached) = self
+            .entries
+            .get(&session.path)
+            .filter(|cached| cached.updated_at == session.updated_at)
+        {
+            let mut enriched = session.clone();
+            enriched.tokens = cached.tokens;
+            enriched.cost_usd = cached.cost_usd;
+            return Ok(enriched);
+        }
+
+        let enriched = catalog.with_usage(session)?;
+        self.entries.insert(
+            session.path.clone(),
+            CachedUsage {
+                updated_at: session.updated_at,
+                tokens: enriched.tokens,
+                cost_usd: enriched.cost_usd,
+            },
+        );
+        Ok(enriched)
+    }
+}
+
 impl SessionCatalog {
     #[cfg(test)]
     pub fn scan(home: &Path) -> Result<Self> {
@@ -54,6 +96,9 @@ impl SessionCatalog {
         if provider.is_none_or(|kind| kind == &AgentKind::Pi) {
             scan_pi(home, &mut sessions)?;
         }
+        if provider.is_none_or(|kind| kind == &AgentKind::OhMyPi) {
+            scan_oh_my_pi(home, &mut sessions)?;
+        }
         sessions.sort_by(|left, right| {
             right
                 .updated_at
@@ -67,7 +112,6 @@ impl SessionCatalog {
         })
     }
 
-    #[cfg(test)]
     pub fn sessions(&self) -> &[AgentSession] {
         &self.sessions
     }
@@ -93,11 +137,22 @@ impl SessionCatalog {
         &self,
         kind: &AgentKind,
         project: Option<&Path>,
+        process_started_at: u64,
     ) -> Option<&AgentSession> {
-        let project = project?;
+        if let Some(project) = project.filter(|project| !is_root(project)) {
+            return self
+                .sessions
+                .iter()
+                .filter(|session| {
+                    &session.kind == kind && session.project.as_deref() == Some(project)
+                })
+                .max_by_key(|session| session.updated_at);
+        }
         self.sessions
             .iter()
-            .filter(|session| &session.kind == kind && session.project.as_deref() == Some(project))
+            .filter(|session| {
+                &session.kind == kind && session.updated_at >= process_started_at.saturating_sub(5)
+            })
             .max_by_key(|session| session.updated_at)
     }
 
@@ -108,7 +163,7 @@ impl SessionCatalog {
             AgentKind::ClaudeCode => claude_usage(&session.path)?,
             AgentKind::GeminiCli => gemini_usage(&session.path)?,
             AgentKind::OpenCode => opencode_usage(&self.home, &session.id)?,
-            AgentKind::Pi => pi_usage(&session.path)?,
+            AgentKind::Pi | AgentKind::OhMyPi => pi_usage(&session.path)?,
             AgentKind::Cursor | AgentKind::Custom(_) => (None, None),
         };
         enriched.tokens = tokens;
@@ -242,11 +297,23 @@ fn scan_opencode(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
 }
 
 fn scan_pi(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
-    for path in files_with_extension(&home.join(".pi/agent/sessions"), "jsonl")? {
+    scan_pi_sessions(&home.join(".pi/agent/sessions"), &AgentKind::Pi, sessions)
+}
+
+fn scan_oh_my_pi(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
+    scan_pi_sessions(
+        &home.join(".omp/agent/sessions"),
+        &AgentKind::OhMyPi,
+        sessions,
+    )
+}
+
+fn scan_pi_sessions(root: &Path, kind: &AgentKind, sessions: &mut Vec<AgentSession>) -> Result<()> {
+    for path in files_with_extension(root, "jsonl")? {
         let mut id = None;
         let mut project = None;
         let mut started_at = None;
-        visit_bounded_lines_limit(&path, Some(1), |line| {
+        visit_bounded_lines_limit(&path, Some(64), |line| {
             let Ok(record) = serde_json::from_slice::<Value>(line) else {
                 return;
             };
@@ -258,7 +325,7 @@ fn scan_pi(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
         })?;
         if let Some(id) = id {
             sessions.push(session(
-                AgentKind::Pi,
+                kind.clone(),
                 id,
                 project,
                 path,
@@ -269,6 +336,10 @@ fn scan_pi(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn is_root(path: &Path) -> bool {
+    path.parent().is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,8 +679,17 @@ mod tests {
             ),
         );
 
+        write(
+            &home.join(".omp/agent/sessions/project/omp.jsonl"),
+            concat!(
+                "{\"type\":\"title\",\"title\":\"Fixture\"}\n",
+                "{\"type\":\"session\",\"id\":\"omp-id\",\"cwd\":\"/work/omp\",\"timestamp\":\"2026-01-02T03:04:05Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":88,\"cost\":{\"total\":0.75}}}}\n"
+            ),
+        );
+
         let catalog = SessionCatalog::scan(home).expect("scan sessions");
-        assert_eq!(catalog.sessions().len(), 5);
+        assert_eq!(catalog.sessions().len(), 6);
         assert_session(&catalog, &AgentKind::Codex, "codex-id", 120, None);
         assert_session(&catalog, &AgentKind::ClaudeCode, "claude-id", 100, None);
         assert_session(&catalog, &AgentKind::GeminiCli, "gemini-id", 55, None);
@@ -621,6 +701,43 @@ mod tests {
             Some(0.25),
         );
         assert_session(&catalog, &AgentKind::Pi, "pi-id", 77, Some(0.5));
+        assert_session(&catalog, &AgentKind::OhMyPi, "omp-id", 88, Some(0.75));
+    }
+
+    #[test]
+    fn matches_a_recent_session_when_a_gui_agent_reports_the_root_directory() {
+        let temp = tempdir().expect("temp home");
+        let session_path = temp.path().join(".codex/sessions/2026/01/02/codex.jsonl");
+        write(
+            &session_path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-id\",\"cwd\":\"/work/project\"}}\n",
+        );
+        let catalog = SessionCatalog::scan(temp.path()).expect("scan sessions");
+        let updated_at = catalog.sessions()[0].updated_at;
+
+        let matched = catalog
+            .latest_for_process(
+                &AgentKind::Codex,
+                Some(std::path::Path::new("/")),
+                updated_at,
+            )
+            .expect("recent Codex session");
+
+        assert_eq!(matched.id, "codex-id");
+        assert_eq!(
+            matched.project.as_deref(),
+            Some(std::path::Path::new("/work/project"))
+        );
+        assert!(
+            catalog
+                .latest_for_process(
+                    &AgentKind::Codex,
+                    Some(std::path::Path::new("/work/other-project")),
+                    updated_at,
+                )
+                .is_none(),
+            "a meaningful cwd must never fall back to another project's session"
+        );
     }
 
     fn assert_session(

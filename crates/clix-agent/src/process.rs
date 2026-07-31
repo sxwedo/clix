@@ -15,6 +15,7 @@ pub enum AgentKind {
     GeminiCli,
     OpenCode,
     Pi,
+    OhMyPi,
     Cursor,
     Custom(String),
 }
@@ -28,6 +29,7 @@ impl AgentKind {
             Self::GeminiCli => "gemini",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
+            Self::OhMyPi => "omp",
             Self::Cursor => "cursor",
             Self::Custom(name) => name.as_str(),
         }
@@ -41,6 +43,7 @@ impl AgentKind {
             "gemini" => Some(Self::GeminiCli),
             "opencode" => Some(Self::OpenCode),
             "pi" => Some(Self::Pi),
+            "omp" => Some(Self::OhMyPi),
             "cursor" => Some(Self::Cursor),
             _ => None,
         }
@@ -55,6 +58,7 @@ impl fmt::Display for AgentKind {
             Self::GeminiCli => "Gemini CLI",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
+            Self::OhMyPi => "Oh My Pi",
             Self::Cursor => "Cursor",
             Self::Custom(name) => name,
         };
@@ -99,6 +103,7 @@ pub fn recognize_agent(process: &ProcessSnapshot) -> Option<AgentKind> {
         "gemini" => return Some(AgentKind::GeminiCli),
         "opencode" => return Some(AgentKind::OpenCode),
         "pi" => return Some(AgentKind::Pi),
+        "omp" => return Some(AgentKind::OhMyPi),
         "cursor-agent" => return Some(AgentKind::Cursor),
         _ => {}
     }
@@ -116,6 +121,8 @@ pub fn recognize_agent(process: &ProcessSnapshot) -> Option<AgentKind> {
         Some(AgentKind::GeminiCli)
     } else if command.contains("opencode-ai") || command.contains("/opencode/") {
         Some(AgentKind::OpenCode)
+    } else if command.contains("@oh-my-pi/pi-coding-agent") {
+        Some(AgentKind::OhMyPi)
     } else if command.contains("pi-coding-agent") {
         Some(AgentKind::Pi)
     } else {

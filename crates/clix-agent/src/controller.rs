@@ -2,26 +2,36 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use clix_core::settings::{CustomAgentSettings, Settings};
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use serde_json::Value;
 
 use crate::process::{
     AgentKind, LiveAgent, discover_live_agents, discover_live_agents_with_cpu, stop_agent,
 };
-use crate::session::{AgentSession, SessionCatalog, tail_records};
-use crate::view::{format_bytes, format_duration, render_process_table};
-use crate::{LogsArgs, PsArgs, ResumeArgs, StopArgs, TargetArgs, TopArgs};
+use crate::session::{AgentSession, SessionCatalog, UsageCache, tail_records};
+use crate::view::{
+    AgentReport, format_bytes, format_duration, render_process_table, render_session_table,
+};
+use crate::{LogsArgs, PsArgs, ResumeArgs, SessionsArgs, StopArgs, TargetArgs, TopArgs};
 
 pub fn run_ps(args: &PsArgs, settings: &Settings) -> Result<()> {
     let agents = discover_live_agents(&settings.agent.custom)?;
+    let mut usage_cache = UsageCache::default();
+    let reports = agent_reports(agents, &mut usage_cache)?;
     if args.json {
-        let rows: Vec<_> = agents.iter().map(process_json).collect();
+        let rows: Vec<_> = reports.iter().map(process_json).collect();
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
-        print!("{}", render_process_table(&agents, false));
+        print!("{}", render_process_table(&reports, false, None));
     }
     Ok(())
 }
@@ -33,17 +43,17 @@ pub fn run_top(args: &TopArgs, settings: &Settings) -> Result<()> {
     if args.iterations == Some(0) {
         bail!("--iterations must be at least 1");
     }
-    let terminal = io::stdout().is_terminal();
-    let iterations = args
-        .iterations
-        .unwrap_or(if terminal { u64::MAX } else { 1 });
+    if args.iterations.is_none() && io::stdout().is_terminal() && io::stdin().is_terminal() {
+        return run_top_interactive(args, settings);
+    }
+
+    let iterations = args.iterations.unwrap_or(1);
+    let mut usage_cache = UsageCache::default();
     for iteration in 0..iterations {
-        if terminal {
-            print!("\u{1b}[2J\u{1b}[H");
-        }
         let agents = discover_live_agents_with_cpu(&settings.agent.custom, true)?;
-        println!("clix agent top — {} running\n", agents.len());
-        print!("{}", render_process_table(&agents, true));
+        let reports = agent_reports(agents, &mut usage_cache)?;
+        println!("clix agent top — {} running\n", reports.len());
+        print!("{}", render_process_table(&reports, true, None));
         io::stdout()
             .flush()
             .context("failed to refresh agent view")?;
@@ -54,6 +64,91 @@ pub fn run_top(args: &TopArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn run_top_interactive(args: &TopArgs, settings: &Settings) -> Result<()> {
+    let _terminal = TerminalGuard::enter()?;
+    let mut usage_cache = UsageCache::default();
+    let mut selected = 0_usize;
+    let mut show_details = false;
+
+    loop {
+        let agents = discover_live_agents_with_cpu(&settings.agent.custom, true)?;
+        let reports = agent_reports(agents, &mut usage_cache)?;
+        selected = selected.min(reports.len().saturating_sub(1));
+        draw_top(&reports, selected, show_details)?;
+
+        let deadline = Instant::now() + Duration::from_secs(args.interval);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || !event::poll(remaining).context("failed to poll terminal input")?
+            {
+                break;
+            }
+            match event::read().context("failed to read terminal input")? {
+                Event::Key(key) if is_key_press(&key) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(());
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if selected + 1 < reports.len() {
+                            selected += 1;
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Char('i') => show_details = !show_details,
+                    KeyCode::Char('r') => break,
+                    _ => continue,
+                },
+                Event::Resize(_, _) => {}
+                _ => continue,
+            }
+            draw_top(&reports, selected, show_details)?;
+        }
+    }
+}
+
+fn draw_top(reports: &[AgentReport], selected: usize, show_details: bool) -> Result<()> {
+    let mut stdout = io::stdout();
+    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .context("failed to clear interactive agent view")?;
+    writeln!(stdout, "clix agent top — {} running\n", reports.len())?;
+    write!(
+        stdout,
+        "{}",
+        render_process_table(reports, true, Some(selected))
+    )?;
+    if show_details && let Some(report) = reports.get(selected) {
+        writeln!(stdout)?;
+        writeln!(stdout, "Selected: {}", report_id(report))?;
+        writeln!(stdout, "Project:  {}", display_path(report.project()))?;
+        writeln!(
+            stdout,
+            "Session:  {}",
+            report.session.as_ref().map_or_else(
+                || "-".to_owned(),
+                |session| format!("{}:{}", session.kind.slug(), session.id)
+            )
+        )?;
+        writeln!(
+            stdout,
+            "Usage:    {} tokens, {}",
+            format_tokens(report.session.as_ref().and_then(|session| session.tokens)),
+            report.session.as_ref().map_or_else(
+                || "cost -".to_owned(),
+                |session| format!("cost {}", format_cost(session.cost_usd))
+            )
+        )?;
+    }
+    writeln!(
+        stdout,
+        "\n↑/↓ or j/k select  Enter/i details  r refresh  q quit"
+    )?;
+    stdout.flush().context("failed to refresh agent view")
+}
+
 pub fn run_inspect(args: &TargetArgs, settings: &Settings) -> Result<()> {
     if is_live_selector(&args.target, &settings.agent.custom) {
         let live = discover_live_agents(&settings.agent.custom)?;
@@ -61,11 +156,19 @@ pub fn run_inspect(args: &TargetArgs, settings: &Settings) -> Result<()> {
             .with_context(|| format!("running agent not found: {}", args.target))?;
         let catalog = scan_sessions(Some(&agent.kind))?;
         let session = catalog
-            .latest_for_process(&agent.kind, agent.process.cwd.as_deref())
+            .latest_for_process(
+                &agent.kind,
+                agent.process.cwd.as_deref(),
+                agent.process.started_at,
+            )
             .map(|session| catalog.with_usage(session))
             .transpose()?;
+        let report = AgentReport {
+            agent: agent.clone(),
+            session: session.clone(),
+        };
         if args.json {
-            let mut value = process_json(agent);
+            let mut value = process_json(&report);
             value["session"] = session.as_ref().map_or(Value::Null, session_json);
             println!("{}", serde_json::to_string_pretty(&value)?);
         } else {
@@ -99,7 +202,11 @@ pub fn run_logs(args: &LogsArgs, settings: &Settings) -> Result<()> {
             .with_context(|| format!("running agent not found: {}", args.target))?;
         catalog = scan_sessions(Some(&agent.kind))?;
         catalog
-            .latest_for_process(&agent.kind, agent.process.cwd.as_deref())
+            .latest_for_process(
+                &agent.kind,
+                agent.process.cwd.as_deref(),
+                agent.process.started_at,
+            )
             .with_context(|| {
                 format!(
                     "no local {} session could be matched to {}; pass a session ID instead",
@@ -129,6 +236,39 @@ pub fn run_logs(args: &LogsArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+pub fn run_sessions(args: &SessionsArgs) -> Result<()> {
+    if args.limit == Some(0) {
+        bail!("--limit must be at least 1");
+    }
+    let provider = args
+        .provider
+        .as_deref()
+        .map(|provider| {
+            AgentKind::from_slug(provider).with_context(|| {
+                format!(
+                    "unsupported session provider `{provider}`; use claude, codex, gemini, opencode, pi, or omp"
+                )
+            })
+        })
+        .transpose()?;
+    if provider == Some(AgentKind::Cursor) {
+        bail!("Cursor does not expose a supported local session catalog");
+    }
+    let catalog = scan_sessions(provider.as_ref())?;
+    let count = args
+        .limit
+        .unwrap_or_else(|| catalog.sessions().len())
+        .min(catalog.sessions().len());
+    let sessions = &catalog.sessions()[..count];
+    if args.json {
+        let values: Vec<_> = sessions.iter().map(session_list_json).collect();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else {
+        print!("{}", render_session_table(sessions, None));
+    }
+    Ok(())
+}
+
 pub fn run_stop(args: &StopArgs, settings: &Settings) -> Result<()> {
     if !is_live_selector(&args.target, &settings.agent.custom) {
         bail!("clix agent stop requires a PID or provider:PID selector");
@@ -151,7 +291,36 @@ pub fn run_stop(args: &StopArgs, settings: &Settings) -> Result<()> {
 }
 
 pub fn run_resume(args: &ResumeArgs, settings: &Settings) -> Result<()> {
-    let (provider, session_id) = split_session_selector(&args.target, &settings.agent.custom);
+    if args.limit == 0 {
+        bail!("--limit must be at least 1");
+    }
+    if args.list {
+        let catalog = scan_sessions(None)?;
+        let sessions = &catalog.sessions()[..catalog.sessions().len().min(args.limit)];
+        print!("{}", render_session_table(sessions, None));
+        return Ok(());
+    }
+
+    let target = if let Some(target) = &args.target {
+        target.clone()
+    } else {
+        let catalog = scan_sessions(None)?;
+        let sessions = &catalog.sessions()[..catalog.sessions().len().min(args.limit)];
+        let selected = if args.last {
+            sessions.first().cloned()
+        } else {
+            pick_resume_session(sessions)?
+        };
+        let Some(session) = selected else {
+            return Ok(());
+        };
+        format!("{}:{}", session.kind.slug(), session.id)
+    };
+    resume_target(&target, settings)
+}
+
+fn resume_target(target: &str, settings: &Settings) -> Result<()> {
+    let (provider, session_id) = split_session_selector(target, &settings.agent.custom);
     if let Some(name) = provider.filter(|name| settings.agent.custom.contains_key(*name)) {
         let custom = &settings.agent.custom[name];
         let spec = custom_resume_spec(name, custom, session_id)?;
@@ -171,6 +340,47 @@ pub fn run_resume(args: &ResumeArgs, settings: &Settings) -> Result<()> {
     };
     let spec = resume_spec(&kind, &id)?;
     execute_resume(&spec, &kind, &id, project)
+}
+
+fn pick_resume_session(sessions: &[AgentSession]) -> Result<Option<AgentSession>> {
+    if sessions.is_empty() {
+        bail!("no saved developer-agent sessions were found");
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("interactive session selection requires a terminal; use `clix agent resume --list`");
+    }
+
+    let _terminal = TerminalGuard::enter()?;
+    let mut selected = 0_usize;
+    loop {
+        let mut stdout = io::stdout();
+        execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+            .context("failed to clear session picker")?;
+        writeln!(stdout, "Select a session to resume\n")?;
+        write!(stdout, "{}", render_session_table(sessions, Some(selected)))?;
+        writeln!(stdout, "\n↑/↓ or j/k select  Enter resume  q cancel")?;
+        stdout.flush().context("failed to refresh session picker")?;
+
+        if let Event::Key(key) = event::read().context("failed to read terminal input")? {
+            if !is_key_press(&key) {
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None);
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if selected + 1 < sessions.len() {
+                        selected += 1;
+                    }
+                }
+                KeyCode::Enter => return Ok(sessions.get(selected).cloned()),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn execute_resume(
@@ -222,6 +432,7 @@ fn resume_spec(kind: &AgentKind, id: &str) -> Result<ResumeSpec> {
         AgentKind::GeminiCli => ("gemini", vec!["--resume".to_owned(), id.to_owned()]),
         AgentKind::OpenCode => ("opencode", vec!["--session".to_owned(), id.to_owned()]),
         AgentKind::Pi => ("pi", vec!["--session".to_owned(), id.to_owned()]),
+        AgentKind::OhMyPi => ("omp", vec!["--resume".to_owned(), id.to_owned()]),
         AgentKind::Cursor => ("cursor-agent", vec!["--resume".to_owned(), id.to_owned()]),
         AgentKind::Custom(name) => {
             bail!("custom agent {name} does not define a resume command")
@@ -251,6 +462,24 @@ fn scan_sessions(provider: Option<&AgentKind>) -> Result<SessionCatalog> {
     let home =
         dirs::home_dir().context("could not resolve the home directory for agent sessions")?;
     SessionCatalog::scan_provider(&home, provider)
+}
+
+fn agent_reports(agents: Vec<LiveAgent>, usage_cache: &mut UsageCache) -> Result<Vec<AgentReport>> {
+    let catalog = scan_sessions(None)?;
+    agents
+        .into_iter()
+        .map(|agent| {
+            let session = catalog
+                .latest_for_process(
+                    &agent.kind,
+                    agent.process.cwd.as_deref(),
+                    agent.process.started_at,
+                )
+                .map(|session| usage_cache.enrich(&catalog, session))
+                .transpose()?;
+            Ok(AgentReport { agent, session })
+        })
+        .collect()
 }
 
 fn resolve_live<'a>(
@@ -297,25 +526,28 @@ fn is_provider(
 ) -> bool {
     matches!(
         name,
-        "claude" | "codex" | "gemini" | "opencode" | "pi" | "cursor"
+        "claude" | "codex" | "gemini" | "opencode" | "pi" | "omp" | "cursor"
     ) || custom.contains_key(name)
 }
 
-fn process_json(agent: &LiveAgent) -> Value {
+fn process_json(report: &AgentReport) -> Value {
+    let agent = &report.agent;
     serde_json::json!({
         "id": format!("{}:{}", agent.kind.slug(), agent.process.pid),
         "agent": agent.kind.slug(),
         "pid": agent.process.pid,
         "parent_pid": agent.process.parent_pid,
         "executable": agent.process.executable,
-        "project": agent.process.cwd,
+        "project": report.project(),
         "status": agent.process.status,
         "started_at_unix": agent.process.started_at,
         "duration_seconds": agent.process.run_time,
         "cpu_percent": agent.process.cpu_percent,
         "memory_bytes": agent.process.memory_bytes,
-        "tokens": null,
-        "cost_usd": null,
+        "session_id": report.session.as_ref().map(|session| &session.id),
+        "tokens": report.session.as_ref().and_then(|session| session.tokens),
+        "cost_usd": report.session.as_ref().and_then(|session| session.cost_usd),
+        "cost_status": report.session.as_ref().map(|session| if session.cost_usd.is_some() { "recorded" } else { "not_recorded" }),
     })
 }
 
@@ -329,6 +561,18 @@ fn session_json(session: &AgentSession) -> Value {
         "updated_at_unix": session.updated_at,
         "tokens": session.tokens,
         "cost_usd": session.cost_usd,
+    })
+}
+
+fn session_list_json(session: &AgentSession) -> Value {
+    serde_json::json!({
+        "target": format!("{}:{}", session.kind.slug(), session.id),
+        "agent": session.kind.slug(),
+        "session_id": session.id,
+        "project": session.project,
+        "log": session.path,
+        "started_at": session.started_at,
+        "updated_at_unix": session.updated_at,
     })
 }
 
@@ -346,7 +590,11 @@ fn print_live_details(agent: &LiveAgent, session: Option<&AgentSession>) {
     println!("Executable:  {}", agent.process.executable.display());
     println!(
         "Project:     {}",
-        display_path(agent.process.cwd.as_deref())
+        display_path(
+            session
+                .and_then(|session| session.project.as_deref())
+                .or(agent.process.cwd.as_deref())
+        )
     );
     println!("Status:      {}", agent.process.status);
     println!("Duration:    {}", format_duration(agent.process.run_time));
@@ -475,12 +723,16 @@ fn display_path(path: Option<&Path>) -> String {
     path.map_or_else(|| "-".to_owned(), |path| path.display().to_string())
 }
 
+fn report_id(report: &AgentReport) -> String {
+    format!("{}:{}", report.agent.kind.slug(), report.agent.process.pid)
+}
+
 fn format_tokens(tokens: Option<u64>) -> String {
     tokens.map_or_else(|| "-".to_owned(), |tokens| tokens.to_string())
 }
 
 fn format_cost(cost: Option<f64>) -> String {
-    cost.map_or_else(|| "-".to_owned(), |cost| format!("${cost:.4}"))
+    cost.map_or_else(|| "n/a".to_owned(), |cost| format!("${cost:.4}"))
 }
 
 fn format_unix_timestamp(timestamp: u64) -> String {
@@ -488,6 +740,30 @@ fn format_unix_timestamp(timestamp: u64) -> String {
         .ok()
         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
         .map_or_else(|| timestamp.to_string(), |value| value.to_rfc3339())
+}
+
+const fn is_key_press(key: &KeyEvent) -> bool {
+    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable terminal raw mode")?;
+        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
+            let _ = disable_raw_mode();
+            return Err(error).context("failed to enter the interactive terminal view");
+        }
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
 }
 
 #[cfg(test)]
@@ -553,6 +829,13 @@ mod tests {
                 ResumeSpec {
                     program: "pi".to_owned(),
                     args: vec!["--session".to_owned(), "session-id".to_owned()],
+                },
+            ),
+            (
+                AgentKind::OhMyPi,
+                ResumeSpec {
+                    program: "omp".to_owned(),
+                    args: vec!["--resume".to_owned(), "session-id".to_owned()],
                 },
             ),
             (

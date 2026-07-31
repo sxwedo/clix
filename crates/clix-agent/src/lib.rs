@@ -28,6 +28,8 @@ pub enum AgentCommand {
     Inspect(TargetArgs),
     /// Show the tail of a local agent session log
     Logs(LogsArgs),
+    /// List saved sessions, including sessions without a running process
+    Sessions(SessionsArgs),
     /// Gracefully terminate a running agent process
     Stop(StopArgs),
     /// Resume a saved agent session with its native CLI
@@ -73,6 +75,19 @@ pub struct LogsArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct SessionsArgs {
+    /// Filter by provider: claude, codex, gemini, opencode, pi, or omp
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Show only the most recently updated N sessions
+    #[arg(long)]
+    pub limit: Option<usize>,
+    /// Emit stable machine-readable JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct StopArgs {
     /// PID or provider:PID of the live agent to stop
     pub target: String,
@@ -84,7 +99,16 @@ pub struct StopArgs {
 #[derive(Debug, Clone, Args)]
 pub struct ResumeArgs {
     /// Session ID or provider:session ID
-    pub target: String,
+    pub target: Option<String>,
+    /// List recent resumable sessions without starting one
+    #[arg(long, conflicts_with_all = ["target", "last"])]
+    pub list: bool,
+    /// Resume the most recently updated session
+    #[arg(long, conflicts_with_all = ["target", "list"])]
+    pub last: bool,
+    /// Maximum number of sessions shown by the list or picker
+    #[arg(long, default_value_t = 30)]
+    pub limit: usize,
 }
 
 /// Execute one `clix agent` command.
@@ -100,6 +124,7 @@ pub fn run(args: AgentArgs, settings: &Settings) -> Result<()> {
         AgentCommand::Top(args) => controller::run_top(&args, settings),
         AgentCommand::Inspect(args) => controller::run_inspect(&args, settings),
         AgentCommand::Logs(args) => controller::run_logs(&args, settings),
+        AgentCommand::Sessions(args) => controller::run_sessions(&args),
         AgentCommand::Stop(args) => controller::run_stop(&args, settings),
         AgentCommand::Resume(args) => controller::run_resume(&args, settings),
     }
@@ -111,7 +136,8 @@ mod tests {
 
     use super::{AgentKind, ProcessSnapshot};
     use crate::process::{LiveAgent, recognize_agent};
-    use crate::view::render_process_table;
+    use crate::session::AgentSession;
+    use crate::view::{AgentReport, render_process_table};
 
     fn process(executable: &str, command: &[&str]) -> ProcessSnapshot {
         ProcessSnapshot {
@@ -136,6 +162,7 @@ mod tests {
             ("/opt/bin/gemini", AgentKind::GeminiCli),
             ("/opt/bin/opencode", AgentKind::OpenCode),
             ("/opt/bin/pi", AgentKind::Pi),
+            ("/opt/bin/omp", AgentKind::OhMyPi),
             ("/opt/bin/cursor-agent", AgentKind::Cursor),
         ];
 
@@ -179,6 +206,16 @@ mod tests {
             )),
             Some(AgentKind::GeminiCli)
         );
+        assert_eq!(
+            recognize_agent(&process(
+                "/usr/bin/node",
+                &[
+                    "node",
+                    "/lib/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"
+                ]
+            )),
+            Some(AgentKind::OhMyPi)
+        );
     }
 
     #[test]
@@ -187,8 +224,21 @@ mod tests {
             kind: AgentKind::Codex,
             process: process("/opt/bin/codex", &["codex"]),
         };
+        let report = AgentReport {
+            agent,
+            session: Some(AgentSession {
+                kind: AgentKind::Codex,
+                id: "session-id".to_owned(),
+                project: Some(PathBuf::from("/work/actual-project")),
+                path: PathBuf::from("/tmp/session.jsonl"),
+                started_at: None,
+                updated_at: 1,
+                tokens: Some(12_345),
+                cost_usd: None,
+            }),
+        };
 
-        let rendered = render_process_table(&[agent], false);
+        let rendered = render_process_table(&[report], false, None);
 
         assert!(rendered.contains("ID"));
         assert!(rendered.contains("AGENT"));
@@ -198,7 +248,8 @@ mod tests {
         assert!(rendered.contains("TOKENS"));
         assert!(rendered.contains("COST"));
         assert!(rendered.contains("codex:42"));
-        assert!(rendered.contains("project"));
-        assert!(rendered.contains('-'));
+        assert!(rendered.contains("actual-project"));
+        assert!(rendered.contains("12.3K"));
+        assert!(rendered.contains("n/a"));
     }
 }

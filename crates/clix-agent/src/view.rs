@@ -3,9 +3,30 @@ use std::fmt::Write as _;
 use unicode_width::UnicodeWidthStr;
 
 use crate::process::LiveAgent;
+use crate::session::AgentSession;
 
-pub fn render_process_table(agents: &[LiveAgent], resources: bool) -> String {
-    if agents.is_empty() {
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentReport {
+    pub agent: LiveAgent,
+    pub session: Option<AgentSession>,
+}
+
+impl AgentReport {
+    #[must_use]
+    pub fn project(&self) -> Option<&std::path::Path> {
+        self.session
+            .as_ref()
+            .and_then(|session| session.project.as_deref())
+            .or(self.agent.process.cwd.as_deref())
+    }
+}
+
+pub fn render_process_table(
+    reports: &[AgentReport],
+    resources: bool,
+    selected: Option<usize>,
+) -> String {
+    if reports.is_empty() {
         return "No running developer agents found.\n".to_owned();
     }
 
@@ -15,29 +36,98 @@ pub fn render_process_table(agents: &[LiveAgent], resources: bool) -> String {
     }
     headers.extend(["TOKENS", "COST"]);
 
-    let rows: Vec<Vec<String>> = agents
+    let rows: Vec<Vec<String>> = reports
         .iter()
-        .map(|agent| {
+        .enumerate()
+        .map(|(index, report)| {
+            let agent = &report.agent;
             let mut row = vec![
                 format!("{}:{}", agent.kind.slug(), agent.process.pid),
                 agent.kind.to_string(),
-                agent
-                    .process
-                    .cwd
-                    .as_deref()
+                report
+                    .project()
                     .map_or_else(|| "-".to_owned(), project_label),
                 agent.process.status.clone(),
                 format_duration(agent.process.run_time),
             ];
+            if let Some(selected) = selected {
+                row.insert(
+                    0,
+                    if selected == index {
+                        ">".to_owned()
+                    } else {
+                        " ".to_owned()
+                    },
+                );
+            }
             if resources {
                 row.push(format!("{:.1}%", agent.process.cpu_percent));
                 row.push(format_bytes(agent.process.memory_bytes));
             }
-            row.extend(["-".to_owned(), "-".to_owned()]);
+            let tokens = report
+                .session
+                .as_ref()
+                .and_then(|session| session.tokens)
+                .map_or_else(|| "-".to_owned(), format_tokens);
+            let cost = report.session.as_ref().map_or_else(
+                || "-".to_owned(),
+                |session| {
+                    session
+                        .cost_usd
+                        .map_or_else(|| "n/a".to_owned(), |cost| format!("${cost:.4}"))
+                },
+            );
+            row.extend([tokens, cost]);
             row
         })
         .collect();
-    render_table(&headers, &rows)
+    if selected.is_some() {
+        let mut display_headers = Vec::with_capacity(headers.len() + 1);
+        display_headers.push("");
+        display_headers.extend(headers);
+        render_table(&display_headers, &rows)
+    } else {
+        render_table(&headers, &rows)
+    }
+}
+
+pub fn render_session_table(sessions: &[AgentSession], selected: Option<usize>) -> String {
+    if sessions.is_empty() {
+        return "No saved developer-agent sessions found.\n".to_owned();
+    }
+
+    let headers = ["TARGET", "AGENT", "PROJECT", "UPDATED"];
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .enumerate()
+        .map(|(index, session)| {
+            let mut row = vec![
+                format!("{}:{}", session.kind.slug(), session.id),
+                session.kind.to_string(),
+                session
+                    .project
+                    .as_deref()
+                    .map_or_else(|| "-".to_owned(), project_label),
+                format_age(session.updated_at),
+            ];
+            if let Some(selected) = selected {
+                row.insert(
+                    0,
+                    if selected == index {
+                        ">".to_owned()
+                    } else {
+                        " ".to_owned()
+                    },
+                );
+            }
+            row
+        })
+        .collect();
+    if selected.is_some() {
+        render_table(&["", "TARGET", "AGENT", "PROJECT", "UPDATED"], &rows)
+    } else {
+        render_table(&headers, &rows)
+    }
 }
 
 fn render_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -84,6 +174,33 @@ fn project_label(path: &std::path::Path) -> String {
             || path.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         )
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format_compact(tokens, 1_000_000, "M")
+    } else if tokens >= 1_000 {
+        format_compact(tokens, 1_000, "K")
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_compact(value: u64, unit: u64, suffix: &str) -> String {
+    let mut whole = value / unit;
+    let mut decimal = (value % unit * 10 + unit / 2) / unit;
+    if decimal == 10 {
+        whole += 1;
+        decimal = 0;
+    }
+    format!("{whole}.{decimal}{suffix}")
+}
+
+fn format_age(updated_at: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(updated_at, |duration| duration.as_secs());
+    format!("{} ago", format_duration(now.saturating_sub(updated_at)))
 }
 
 pub fn format_duration(seconds: u64) -> String {
