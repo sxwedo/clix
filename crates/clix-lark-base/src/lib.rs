@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 const MAX_WRITE_ATTEMPTS: u32 = 3;
@@ -42,7 +42,8 @@ pub struct TableSchema {
 }
 
 /// One typed value accepted by the Base upsert interface.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BaseValue {
     /// Multi-line text field.
     Text(String),
@@ -56,17 +57,45 @@ pub enum BaseValue {
     MultiSelect(Vec<String>),
     /// Hyperlink field.
     Url { text: String, link: String },
+    /// Explicitly clear a managed field while retaining its expected type.
+    Empty(BaseFieldType),
+}
+
+/// Supported Lark Base field types for explicit empty values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseFieldType {
+    Text,
+    Number,
+    DateTime,
+    Checkbox,
+    MultiSelect,
+    Url,
+}
+
+impl BaseFieldType {
+    const fn code(self) -> u16 {
+        match self {
+            Self::Text => 1,
+            Self::Number => 2,
+            Self::MultiSelect => 4,
+            Self::DateTime => 5,
+            Self::Checkbox => 7,
+            Self::Url => 15,
+        }
+    }
 }
 
 impl BaseValue {
     const fn field_type(&self) -> u16 {
         match self {
-            Self::Text(_) => 1,
-            Self::Number(_) => 2,
-            Self::MultiSelect(_) => 4,
-            Self::DateTime(_) => 5,
-            Self::Checkbox(_) => 7,
-            Self::Url { .. } => 15,
+            Self::Text(_) => BaseFieldType::Text.code(),
+            Self::Number(_) => BaseFieldType::Number.code(),
+            Self::MultiSelect(_) => BaseFieldType::MultiSelect.code(),
+            Self::DateTime(_) => BaseFieldType::DateTime.code(),
+            Self::Checkbox(_) => BaseFieldType::Checkbox.code(),
+            Self::Url { .. } => BaseFieldType::Url.code(),
+            Self::Empty(field_type) => field_type.code(),
         }
     }
 
@@ -81,6 +110,7 @@ impl BaseValue {
                 "text": text,
                 "link": link,
             }),
+            Self::Empty(_) => serde_json::Value::Null,
         }
     }
 }
@@ -99,7 +129,15 @@ pub struct UpsertRequest {
     pub target: BaseTarget,
     pub key_field: String,
     pub hash_field: String,
+    pub mode: UpsertMode,
     pub records: Vec<UpsertRecord>,
+}
+
+/// Whether an upsert should write or only return the planned actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpsertMode {
+    Apply,
+    DryRun,
 }
 
 /// The observable action applied to one logical record.
@@ -114,7 +152,7 @@ pub enum UpsertAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpsertReceipt {
     pub key: String,
-    pub remote_id: String,
+    pub remote_id: Option<String>,
     pub action: UpsertAction,
 }
 
@@ -238,92 +276,29 @@ impl LarkBaseClient {
         let existing = self
             .existing_records(&request.target, &request.key_field, &request.hash_field)
             .await?;
-
-        let mut completed = HashMap::new();
-        let mut creates = Vec::new();
-        let mut updates = Vec::new();
-
-        for record in &request.records {
-            let fields = record_fields(&request.key_field, &request.hash_field, record);
-            match existing.get(&record.key) {
-                Some(current) if current.payload_hash.as_deref() == Some(&record.payload_hash) => {
-                    completed.insert(
-                        record.key.clone(),
-                        UpsertReceipt {
-                            key: record.key.clone(),
-                            remote_id: current.record_id.clone(),
-                            action: UpsertAction::Unchanged,
-                        },
-                    );
-                }
-                Some(current) => updates.push(PendingWrite {
-                    key: record.key.clone(),
-                    remote_id: Some(current.record_id.clone()),
-                    fields,
-                }),
-                None => creates.push(PendingWrite {
-                    key: record.key.clone(),
-                    remote_id: None,
-                    fields,
-                }),
-            }
+        let mut plan = plan_upsert(&request, &existing);
+        if request.mode == UpsertMode::DryRun {
+            complete_dry_run(&mut plan);
+        } else {
+            self.apply_plan(&request.target, &mut plan).await?;
         }
+        finish_report(&request.records, plan.completed)
+    }
 
-        for batch in creates.chunks(500) {
+    async fn apply_plan(&self, target: &BaseTarget, plan: &mut UpsertPlan) -> Result<()> {
+        for batch in plan.creates.chunks(500) {
             let receipts = self
-                .write_batch(
-                    &request.target,
-                    "batch_create",
-                    UpsertAction::Created,
-                    batch,
-                )
+                .write_batch(target, "batch_create", UpsertAction::Created, batch)
                 .await?;
-            completed.extend(
-                receipts
-                    .into_iter()
-                    .map(|receipt| (receipt.key.clone(), receipt)),
-            );
+            extend_completed(&mut plan.completed, receipts);
         }
-        for batch in updates.chunks(500) {
+        for batch in plan.updates.chunks(500) {
             let receipts = self
-                .write_batch(
-                    &request.target,
-                    "batch_update",
-                    UpsertAction::Updated,
-                    batch,
-                )
+                .write_batch(target, "batch_update", UpsertAction::Updated, batch)
                 .await?;
-            completed.extend(
-                receipts
-                    .into_iter()
-                    .map(|receipt| (receipt.key.clone(), receipt)),
-            );
+            extend_completed(&mut plan.completed, receipts);
         }
-
-        let receipts = request
-            .records
-            .iter()
-            .map(|record| {
-                completed
-                    .remove(&record.key)
-                    .with_context(|| format!("Lark upsert omitted result for key {}", record.key))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(UpsertReport {
-            created: receipts
-                .iter()
-                .filter(|receipt| receipt.action == UpsertAction::Created)
-                .count(),
-            updated: receipts
-                .iter()
-                .filter(|receipt| receipt.action == UpsertAction::Updated)
-                .count(),
-            unchanged: receipts
-                .iter()
-                .filter(|receipt| receipt.action == UpsertAction::Unchanged)
-                .count(),
-            receipts,
-        })
+        Ok(())
     }
 
     async fn existing_records(
@@ -441,7 +416,7 @@ impl LarkBaseClient {
                 }
                 Ok(UpsertReceipt {
                     key: pending.key.clone(),
-                    remote_id: remote.record_id,
+                    remote_id: Some(remote.record_id),
                     action,
                 })
             })
@@ -684,10 +659,108 @@ struct ExistingRecord {
     payload_hash: Option<String>,
 }
 
+struct UpsertPlan {
+    completed: HashMap<String, UpsertReceipt>,
+    creates: Vec<PendingWrite>,
+    updates: Vec<PendingWrite>,
+}
+
 struct PendingWrite {
     key: String,
     remote_id: Option<String>,
     fields: serde_json::Map<String, serde_json::Value>,
+}
+
+fn plan_upsert(request: &UpsertRequest, existing: &HashMap<String, ExistingRecord>) -> UpsertPlan {
+    let mut plan = UpsertPlan {
+        completed: HashMap::new(),
+        creates: Vec::new(),
+        updates: Vec::new(),
+    };
+    for record in &request.records {
+        let fields = record_fields(&request.key_field, &request.hash_field, record);
+        match existing.get(&record.key) {
+            Some(current) if current.payload_hash.as_deref() == Some(&record.payload_hash) => {
+                plan.completed.insert(
+                    record.key.clone(),
+                    UpsertReceipt {
+                        key: record.key.clone(),
+                        remote_id: Some(current.record_id.clone()),
+                        action: UpsertAction::Unchanged,
+                    },
+                );
+            }
+            Some(current) => plan.updates.push(PendingWrite {
+                key: record.key.clone(),
+                remote_id: Some(current.record_id.clone()),
+                fields,
+            }),
+            None => plan.creates.push(PendingWrite {
+                key: record.key.clone(),
+                remote_id: None,
+                fields,
+            }),
+        }
+    }
+    plan
+}
+
+fn complete_dry_run(plan: &mut UpsertPlan) {
+    plan.completed.extend(plan.creates.iter().map(|pending| {
+        (
+            pending.key.clone(),
+            UpsertReceipt {
+                key: pending.key.clone(),
+                remote_id: None,
+                action: UpsertAction::Created,
+            },
+        )
+    }));
+    plan.completed.extend(plan.updates.iter().map(|pending| {
+        (
+            pending.key.clone(),
+            UpsertReceipt {
+                key: pending.key.clone(),
+                remote_id: pending.remote_id.clone(),
+                action: UpsertAction::Updated,
+            },
+        )
+    }));
+}
+
+fn extend_completed(completed: &mut HashMap<String, UpsertReceipt>, receipts: Vec<UpsertReceipt>) {
+    completed.extend(
+        receipts
+            .into_iter()
+            .map(|receipt| (receipt.key.clone(), receipt)),
+    );
+}
+
+fn finish_report(
+    records: &[UpsertRecord],
+    mut completed: HashMap<String, UpsertReceipt>,
+) -> Result<UpsertReport> {
+    let receipts = records
+        .iter()
+        .map(|record| {
+            completed
+                .remove(&record.key)
+                .with_context(|| format!("Lark upsert omitted result for key {}", record.key))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(UpsertReport {
+        created: count_action(&receipts, UpsertAction::Created),
+        updated: count_action(&receipts, UpsertAction::Updated),
+        unchanged: count_action(&receipts, UpsertAction::Unchanged),
+        receipts,
+    })
+}
+
+fn count_action(receipts: &[UpsertReceipt], action: UpsertAction) -> usize {
+    receipts
+        .iter()
+        .filter(|receipt| receipt.action == action)
+        .count()
 }
 
 #[derive(Deserialize)]
@@ -781,7 +854,7 @@ mod tests {
 
     use super::{
         BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, TableField, TableSchema,
-        UpsertAction, UpsertRecord, UpsertRequest,
+        UpsertAction, UpsertMode, UpsertRecord, UpsertRequest,
     };
 
     async fn mount_auth(server: &MockServer) {
@@ -978,6 +1051,7 @@ mod tests {
                 target: target(),
                 key_field: "RSS Key".to_string(),
                 hash_field: "Payload Hash".to_string(),
+                mode: UpsertMode::Apply,
                 records: vec![
                     record("same", "hash-same", "Same"),
                     record("new", "hash-new", "New"),
@@ -1049,6 +1123,7 @@ mod tests {
                 target: target(),
                 key_field: "Key".to_string(),
                 hash_field: "Hash".to_string(),
+                mode: UpsertMode::Apply,
                 records: vec![UpsertRecord {
                     key: "one".to_string(),
                     payload_hash: "hash-one".to_string(),
@@ -1062,5 +1137,42 @@ mod tests {
             .expect("transient conflict should be retried");
 
         assert_eq!(report.created, 1);
+    }
+
+    #[tokio::test]
+    async fn dry_run_validates_and_plans_without_calling_write_endpoints() {
+        let server = MockServer::start().await;
+        mount_auth(&server).await;
+        mount_fields(
+            &server,
+            json!([
+                {"field_id": "fld-key", "field_name": "Key", "type": 1},
+                {"field_id": "fld-hash", "field_name": "Hash", "type": 1},
+                {"field_id": "fld-title", "field_name": "Title", "type": 1}
+            ]),
+        )
+        .await;
+        mount_search(&server, "Key", "Hash", json!([])).await;
+
+        let report = client(&server)
+            .upsert_records(UpsertRequest {
+                target: target(),
+                key_field: "Key".to_string(),
+                hash_field: "Hash".to_string(),
+                mode: UpsertMode::DryRun,
+                records: vec![UpsertRecord {
+                    key: "one".to_string(),
+                    payload_hash: "hash-one".to_string(),
+                    fields: BTreeMap::from([(
+                        "Title".to_string(),
+                        BaseValue::Text("One".to_string()),
+                    )]),
+                }],
+            })
+            .await
+            .expect("dry run");
+
+        assert_eq!(report.created, 1);
+        assert_eq!(report.receipts[0].remote_id, None);
     }
 }

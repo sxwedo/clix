@@ -56,12 +56,30 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # state = \"/absolute/path/to/rss.redb\"
 # Maximum entries kept from each feed (default: 20).
 # limit = 20
+# Named destinations automatically pushed after a successful local sync.
+# push_to = [\"news\"]
 
 # Add one block per subscription. `enabled` defaults to true.
 # [[rss.feeds]]
 # name = \"Rust Blog\"
 # url = \"https://blog.rust-lang.org/feed.xml\"
 # enabled = true
+
+# [rss.destinations.news]
+# type = \"lark_base\"
+# base = \"rss_news\"
+# key_field = \"RSS Key\"
+# hash_field = \"Payload Hash\"
+#
+# [rss.destinations.news.fields]
+# title = \"标题\"
+# url = \"原文链接\"
+# subscription = \"订阅源\"
+# published_at = \"发布时间\"
+# authors = \"作者\"
+# categories = \"分类\"
+# summary = \"摘要\"
+# first_seen_at = \"首次发现时间\"
 ";
 
 /// Top-level configuration mirror of `config.toml`.
@@ -138,9 +156,33 @@ pub struct RssSettings {
     /// Default maximum number of entries retained from each feed.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// Named destinations pushed after a successful local sync.
+    #[serde(default)]
+    pub push_to: Vec<String>,
+    /// Named remote delivery destinations.
+    #[serde(default)]
+    pub destinations: BTreeMap<String, RssDestinationSettings>,
     /// Configured RSS, Atom, or JSON Feed subscriptions.
     #[serde(default)]
     pub feeds: Vec<RssFeedSettings>,
+}
+
+/// One named remote destination for RSS entry delivery.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RssDestinationSettings {
+    /// One Lark Base projection.
+    LarkBase {
+        /// Name of a reusable entry in `[lark.bases]`.
+        base: String,
+        /// Text field containing the stable RSS entry key.
+        key_field: String,
+        /// Text field containing the managed payload hash.
+        hash_field: String,
+        /// Canonical RSS field name to Lark Base field name.
+        #[serde(default)]
+        fields: BTreeMap<String, String>,
+    },
 }
 
 /// One `[[rss.feeds]]` subscription.
@@ -334,6 +376,40 @@ table_id = "tbl_example"
         assert_eq!(base.account, "default");
         assert_eq!(base.app_token, "bascn_example");
         assert_eq!(base.table_id, "tbl_example");
+    }
+
+    #[test]
+    fn rss_lark_destination_parses_with_an_explicit_field_mapping() {
+        let text = r#"
+[rss]
+push_to = ["news"]
+
+[rss.destinations.news]
+type = "lark_base"
+base = "rss_news"
+key_field = "RSS Key"
+hash_field = "Payload Hash"
+
+[rss.destinations.news.fields]
+title = "标题"
+url = "原文链接"
+"#;
+        let settings: Settings = toml::from_str(text).expect("RSS destination config");
+        assert_eq!(settings.rss.push_to, ["news"]);
+        let destination = &settings.rss.destinations["news"];
+        assert!(matches!(
+            destination,
+            RssDestinationSettings::LarkBase {
+                base,
+                key_field,
+                hash_field,
+                fields,
+            } if base == "rss_news"
+                && key_field == "RSS Key"
+                && hash_field == "Payload Hash"
+                && fields["title"] == "标题"
+                && fields["url"] == "原文链接"
+        ));
     }
 
     #[test]

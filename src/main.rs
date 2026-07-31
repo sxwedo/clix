@@ -7,6 +7,7 @@ use clix_gh_stars::StarsArgs;
 use clix_rss_export::ExportArgs;
 use clix_rss_fetch::FetchArgs;
 use clix_rss_list::ListArgs;
+use clix_rss_push::PushArgs;
 use clix_rss_sync::SyncArgs;
 use clix_x_bookmarks::BookmarksArgs;
 use clix_x_read::ReadArgs;
@@ -67,6 +68,8 @@ enum RssCommands {
     Fetch(FetchArgs),
     /// List newest entries stored in the local redb database
     List(ListArgs),
+    /// Push stored entries to a configured remote destination
+    Push(PushArgs),
     /// Incrementally sync configured subscriptions into a redb database
     Sync(SyncArgs),
 }
@@ -114,6 +117,9 @@ fn run(cli: Cli) -> Result<()> {
                     run_async(async move { clix_rss_fetch::run(args, &settings).await })
                 }
                 RssCommands::List(args) => clix_rss_list::run(args, &settings),
+                RssCommands::Push(args) => {
+                    run_async(async move { clix_rss_push::run(args, &settings).await })
+                }
                 RssCommands::Sync(args) => {
                     run_async(async move { clix_rss_sync::run(args, &settings).await })
                 }
@@ -288,6 +294,29 @@ mod tests {
             Commands::Rss {
                 command: RssCommands::List(args)
             } if args.feeds == ["Rust Blog"] && args.limit == Some(10)
+        ));
+    }
+
+    #[test]
+    fn parses_the_documented_rss_push_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "rss",
+            "push",
+            "news",
+            "--dry-run",
+            "--feed",
+            "Rust Blog",
+        ])
+        .expect("documented RSS push arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::Push(args)
+            } if args.destination == "news"
+                && args.dry_run
+                && args.feeds == ["Rust Blog"]
         ));
     }
 

@@ -8,6 +8,7 @@ members = [
     "crates/clix-rss-export",
     "crates/clix-rss-fetch",
     "crates/clix-rss-list",
+    "crates/clix-rss-push",
     "crates/clix-rss-store",
     "crates/clix-rss-sync",
     "crates/clix-x-api",
@@ -35,6 +36,7 @@ indicatif = "0.17"
 reqwest = { version = "0.12", default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 tempfile = "3.27"
 redb = "2"
 toml = "0.8"
@@ -62,6 +64,7 @@ clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-rss-export = { path = "crates/clix-rss-export" }
 clix-rss-fetch = { path = "crates/clix-rss-fetch" }
 clix-rss-list = { path = "crates/clix-rss-list" }
+clix-rss-push = { path = "crates/clix-rss-push" }
 clix-rss-sync = { path = "crates/clix-rss-sync" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }
 clix-x-read = { path = "crates/clix-x-read" }

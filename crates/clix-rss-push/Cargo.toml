@@ -1,0 +1,25 @@
+[package]
+name = "clix-rss-push"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Reliably push stored RSS entries to configured remote destinations."
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+clap.workspace = true
+clix-core = { path = "../clix-core" }
+clix-lark-base = { path = "../clix-lark-base" }
+clix-rss-store = { path = "../clix-rss-store" }
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[dev-dependencies]
+clix-rss-api = { path = "../clix-rss-api" }
+tempfile.workspace = true
+toml.workspace = true
