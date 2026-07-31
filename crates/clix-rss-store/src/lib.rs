@@ -24,6 +24,8 @@ pub struct StoredEntry {
     pub feed_updated_at: Option<String>,
     pub entry: FetchedEntry,
     pub first_seen_at: String,
+    #[serde(default)]
+    extra: EntryExtra,
 }
 
 impl StoredEntry {
@@ -37,6 +39,7 @@ impl StoredEntry {
             feed_updated_at: feed.updated_at.clone(),
             entry: entry.clone(),
             first_seen_at: first_seen_at.to_string(),
+            extra: EntryExtra::default(),
         }
     }
 
@@ -48,6 +51,97 @@ impl StoredEntry {
             .as_deref()
             .unwrap_or(&self.first_seen_at)
     }
+
+    /// Return the opaque key used to address this entry in the store.
+    #[must_use]
+    pub fn storage_key(&self) -> String {
+        entry_key(&self.source_url, &self.entry.id)
+    }
+
+    /// Return the latest checkpoint for a named delivery destination.
+    #[must_use]
+    pub fn delivery_state(&self, destination: &str) -> Option<&DeliveryState> {
+        self.extra.deliveries.get(destination)
+    }
+}
+
+/// Current status of the latest delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryStatus {
+    /// The payload was confirmed at the remote destination.
+    Succeeded,
+    /// The latest attempt failed and should be retried.
+    Failed,
+}
+
+/// Durable checkpoint for one entry at one named destination.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DeliveryState {
+    pub kind: String,
+    pub target_fingerprint: String,
+    pub payload_hash: String,
+    pub status: DeliveryStatus,
+    pub remote_id: Option<String>,
+    pub attempts: u32,
+    pub last_attempt_at: String,
+    pub delivered_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl DeliveryState {
+    /// Return whether this checkpoint confirms the exact target and payload.
+    #[must_use]
+    pub fn confirms(&self, target_fingerprint: &str, payload_hash: &str) -> bool {
+        self.status == DeliveryStatus::Succeeded
+            && self.target_fingerprint == target_fingerprint
+            && self.payload_hash == payload_hash
+    }
+}
+
+/// Remote outcome to persist for one delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The destination confirmed the payload and returned its remote record ID.
+    Succeeded { remote_id: String },
+    /// The attempt failed with an actionable bounded error summary.
+    Failed { error: String },
+}
+
+/// One delivery result to merge into an existing RSS record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryCheckpoint {
+    pub entry_key: String,
+    pub destination: String,
+    pub kind: String,
+    pub target_fingerprint: String,
+    pub payload_hash: String,
+    pub attempted_at: String,
+    pub outcome: DeliveryOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct EntryExtra {
+    #[serde(default = "current_extra_version")]
+    version: u16,
+    #[serde(default)]
+    deliveries: BTreeMap<String, DeliveryState>,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for EntryExtra {
+    fn default() -> Self {
+        Self {
+            version: current_extra_version(),
+            deliveries: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+        }
+    }
+}
+
+const fn current_extra_version() -> u16 {
+    1
 }
 
 /// Counts returned by one atomic RSS database sync.
@@ -142,6 +236,7 @@ impl RssStore {
                         let current: StoredEntry = serde_json::from_slice(&bytes)
                             .with_context(|| format!("invalid RSS state record for key {key}"))?;
                         candidate.first_seen_at.clone_from(&current.first_seen_at);
+                        candidate.extra.clone_from(&current.extra);
                         if current == candidate {
                             stats.unchanged += 1;
                             continue;
@@ -229,6 +324,69 @@ impl RssStore {
         })
     }
 
+    /// Atomically merge delivery outcomes into their latest stored RSS records.
+    ///
+    /// The method re-reads each record inside the write transaction, so a
+    /// concurrent RSS refresh cannot be overwritten by a stale delivery copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate checkpoints, missing entries,
+    /// corrupt stored JSON, attempt counter overflow, or transaction failure.
+    pub fn record_delivery_outcomes(&self, checkpoints: &[DeliveryCheckpoint]) -> Result<()> {
+        validate_delivery_checkpoints(checkpoints)?;
+        if checkpoints.is_empty() {
+            return Ok(());
+        }
+
+        let transaction = self.db.begin_write()?;
+        {
+            let mut table = transaction.open_table(ENTRIES_TABLE)?;
+            for checkpoint in checkpoints {
+                let bytes = table
+                    .get(checkpoint.entry_key.as_str())?
+                    .with_context(|| {
+                        format!(
+                            "RSS entry no longer exists for key {}",
+                            checkpoint.entry_key
+                        )
+                    })?
+                    .value()
+                    .to_vec();
+                let mut entry: StoredEntry = serde_json::from_slice(&bytes).with_context(|| {
+                    format!("invalid RSS state record for key {}", checkpoint.entry_key)
+                })?;
+                let previous = entry.extra.deliveries.get(&checkpoint.destination);
+                let attempts = previous
+                    .map_or(0, |state| state.attempts)
+                    .checked_add(1)
+                    .context("RSS delivery attempt counter overflow")?;
+                let (status, remote_id, delivered_at, last_error) =
+                    delivery_result_fields(previous, checkpoint);
+                entry.extra.deliveries.insert(
+                    checkpoint.destination.clone(),
+                    DeliveryState {
+                        kind: checkpoint.kind.clone(),
+                        target_fingerprint: checkpoint.target_fingerprint.clone(),
+                        payload_hash: checkpoint.payload_hash.clone(),
+                        status,
+                        remote_id,
+                        attempts,
+                        last_attempt_at: checkpoint.attempted_at.clone(),
+                        delivered_at,
+                        last_error,
+                    },
+                );
+                let serialized = serde_json::to_vec(&entry).with_context(|| {
+                    format!("failed to encode RSS state record {}", checkpoint.entry_key)
+                })?;
+                table.insert(checkpoint.entry_key.as_str(), serialized.as_slice())?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn entry_count(&self) -> Result<usize> {
         let transaction = self.db.begin_read()?;
         match transaction.open_table(ENTRIES_TABLE) {
@@ -236,6 +394,64 @@ impl RssStore {
             Err(redb::TableError::TableDoesNotExist(_)) => Ok(0),
             Err(error) => Err(error.into()),
         }
+    }
+}
+
+fn validate_delivery_checkpoints(checkpoints: &[DeliveryCheckpoint]) -> Result<()> {
+    let mut unique = HashSet::new();
+    for checkpoint in checkpoints {
+        if checkpoint.entry_key.trim().is_empty()
+            || checkpoint.destination.trim().is_empty()
+            || checkpoint.kind.trim().is_empty()
+            || checkpoint.target_fingerprint.trim().is_empty()
+            || checkpoint.payload_hash.trim().is_empty()
+        {
+            bail!("RSS delivery checkpoint fields must not be blank");
+        }
+        DateTime::parse_from_rfc3339(&checkpoint.attempted_at)
+            .with_context(|| "RSS delivery attempted_at must be RFC 3339")?;
+        match &checkpoint.outcome {
+            DeliveryOutcome::Succeeded { remote_id } if remote_id.trim().is_empty() => {
+                bail!("RSS delivery remote ID must not be blank");
+            }
+            DeliveryOutcome::Failed { error } if error.trim().is_empty() => {
+                bail!("RSS delivery error must not be blank");
+            }
+            DeliveryOutcome::Succeeded { .. } | DeliveryOutcome::Failed { .. } => {}
+        }
+        if !unique.insert((&checkpoint.entry_key, &checkpoint.destination)) {
+            bail!(
+                "duplicate RSS delivery checkpoint for entry {} and destination {}",
+                checkpoint.entry_key,
+                checkpoint.destination
+            );
+        }
+    }
+    Ok(())
+}
+
+fn delivery_result_fields(
+    previous: Option<&DeliveryState>,
+    checkpoint: &DeliveryCheckpoint,
+) -> (
+    DeliveryStatus,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match &checkpoint.outcome {
+        DeliveryOutcome::Succeeded { remote_id } => (
+            DeliveryStatus::Succeeded,
+            Some(remote_id.clone()),
+            Some(checkpoint.attempted_at.clone()),
+            None,
+        ),
+        DeliveryOutcome::Failed { error } => (
+            DeliveryStatus::Failed,
+            previous.and_then(|state| state.remote_id.clone()),
+            previous.and_then(|state| state.delivered_at.clone()),
+            Some(error.clone()),
+        ),
     }
 }
 
@@ -382,6 +598,93 @@ mod tests {
         let result = store.query(&EntryQuery::default()).expect("query");
         assert_eq!(result.entries[0].entry.title, "Changed");
         assert_eq!(result.entries[0].first_seen_at, "2026-07-31T01:00:00Z");
+    }
+
+    #[test]
+    fn delivery_checkpoint_survives_unchanged_and_changed_rss_refreshes() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("rss.redb");
+        let store = RssStore::open_or_create(&path).expect("open store");
+        let original = feed(
+            "Example",
+            "https://example.com/feed.xml",
+            &[("one", "Original", "2026-07-31T00:00:00Z")],
+        );
+        store
+            .upsert_feeds(std::slice::from_ref(&original), "2026-07-31T01:00:00Z")
+            .expect("initial sync");
+        let entry = store
+            .query(&EntryQuery::default())
+            .expect("query")
+            .entries
+            .pop()
+            .expect("entry");
+
+        store
+            .record_delivery_outcomes(&[DeliveryCheckpoint {
+                entry_key: entry.storage_key(),
+                destination: "news".to_string(),
+                kind: "lark_base".to_string(),
+                target_fingerprint: "target-v1".to_string(),
+                payload_hash: "payload-v1".to_string(),
+                attempted_at: "2026-07-31T02:00:00Z".to_string(),
+                outcome: DeliveryOutcome::Succeeded {
+                    remote_id: "rec-one".to_string(),
+                },
+            }])
+            .expect("record delivery");
+
+        let unchanged = store
+            .upsert_feeds(std::slice::from_ref(&original), "2026-07-31T03:00:00Z")
+            .expect("unchanged sync");
+        assert_eq!(unchanged.unchanged, 1);
+
+        let changed = feed(
+            "Example",
+            "https://example.com/feed.xml",
+            &[("one", "Changed", "2026-07-31T00:00:00Z")],
+        );
+        let updated = store
+            .upsert_feeds(&[changed], "2026-07-31T04:00:00Z")
+            .expect("changed sync");
+        assert_eq!(updated.updated, 1);
+
+        let entry = &store.query(&EntryQuery::default()).expect("query").entries[0];
+        assert_eq!(entry.entry.title, "Changed");
+        let delivery = entry.delivery_state("news").expect("delivery state");
+        assert_eq!(delivery.status, DeliveryStatus::Succeeded);
+        assert_eq!(delivery.remote_id.as_deref(), Some("rec-one"));
+        assert_eq!(delivery.attempts, 1);
+        assert_eq!(delivery.payload_hash, "payload-v1");
+    }
+
+    #[test]
+    fn legacy_json_without_extra_defaults_to_an_empty_versioned_envelope() {
+        let legacy = serde_json::json!({
+            "subscription": "Example",
+            "source_url": "https://example.com/feed.xml",
+            "feed_title": "Example Feed",
+            "feed_type": "RSS2",
+            "site_url": "https://example.com/",
+            "feed_updated_at": "2026-07-31T00:00:00Z",
+            "entry": {
+                "id": "one",
+                "title": "Original",
+                "url": "https://example.com/one",
+                "published_at": "2026-07-31T00:00:00Z",
+                "authors": ["Ada"],
+                "categories": ["Rust"],
+                "summary": "Summary"
+            },
+            "first_seen_at": "2026-07-31T01:00:00Z"
+        });
+
+        let entry: StoredEntry =
+            serde_json::from_value(legacy).expect("legacy record should remain readable");
+        assert!(entry.delivery_state("news").is_none());
+        let migrated = serde_json::to_value(entry).expect("serialize with extra");
+        assert_eq!(migrated["extra"]["version"], 1);
+        assert_eq!(migrated["extra"]["deliveries"], serde_json::json!({}));
     }
 
     #[test]
