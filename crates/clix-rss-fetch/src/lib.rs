@@ -1,20 +1,15 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Args, ValueEnum};
 use clix_core::ui;
 
-mod fetch;
 mod model;
 mod output;
-mod subscription;
 
-use fetch::fetch_subscriptions;
+use clix_rss_api::{DEFAULT_ENTRY_LIMIT, build_client, fetch_subscriptions, select_subscriptions};
 use model::RssExport;
 use output::{default_output_path, resolve_format, write_output};
-use subscription::select_subscriptions;
-
-const DEFAULT_ENTRY_LIMIT: usize = 20;
 
 /// Supported RSS snapshot formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -64,13 +59,7 @@ pub async fn run(args: FetchArgs, settings: &clix_core::settings::Settings) -> R
     let format = resolve_format(args.format, configured_output.as_deref());
     let output_path = configured_output.unwrap_or_else(|| default_output_path(format));
 
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("clix/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(45))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .context("failed to build RSS HTTP client")?;
+    let client = build_client()?;
 
     let spinner = ui::create_spinner(&format!(
         "fetching {} RSS subscription(s)...",

@@ -267,6 +267,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "clix-rss-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clix-core",
+ "feed-rs",
+ "html2md",
+ "reqwest",
+ "serde",
+ "tokio",
+]
+
+[[package]]
 name = "clix-rss-fetch"
 version = "0.1.0"
 dependencies = [
@@ -274,9 +288,7 @@ dependencies = [
  "chrono",
  "clap",
  "clix-core",
- "feed-rs",
- "html2md",
- "reqwest",
+ "clix-rss-api",
  "serde",
  "serde_json",
  "tempfile",

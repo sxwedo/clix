@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
+    "crates/clix-rss-api",
     "crates/clix-rss-fetch",
     "crates/clix-x-api",
     "crates/clix-x-bookmarks",

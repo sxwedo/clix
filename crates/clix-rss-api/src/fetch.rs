@@ -8,12 +8,14 @@ use crate::{
 const MAX_FEED_BYTES: usize = 10 * 1024 * 1024;
 const MAX_CONCURRENT_FEEDS: usize = 8;
 
+/// A subscription that could not be fetched or parsed.
 #[derive(Debug)]
 pub struct FetchFailure {
     pub subscription: String,
     pub error: String,
 }
 
+/// Fetch and normalize subscriptions with bounded concurrency.
 pub async fn fetch_subscriptions(
     client: &reqwest::Client,
     subscriptions: Vec<Subscription>,
@@ -116,6 +118,11 @@ async fn read_limited_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Parse one RSS, Atom, or JSON Feed document into the shared model.
+///
+/// # Errors
+///
+/// Returns an error when the document is malformed or unsupported.
 pub fn parse_feed(subscription: &Subscription, bytes: &[u8], limit: usize) -> Result<FetchedFeed> {
     let parser = feed_rs::parser::Builder::new()
         .sanitize_content(true)

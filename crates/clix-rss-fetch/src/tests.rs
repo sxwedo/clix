@@ -7,14 +7,13 @@ use std::{
 };
 
 use clix_core::settings::{RssFeedSettings, RssSettings};
+use clix_rss_api::{Subscription, parse_feed, select_subscriptions};
 
 use crate::{
     FetchArgs, OutputFormat,
-    fetch::parse_feed,
     model::RssExport,
     output::{render_markdown, resolve_format},
     run,
-    subscription::{Subscription, select_subscriptions},
 };
 
 const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>

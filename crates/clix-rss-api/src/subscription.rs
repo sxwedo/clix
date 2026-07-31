@@ -3,12 +3,18 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 use clix_core::settings::{RssFeedSettings, RssSettings};
 
+/// One validated RSS subscription selected from the clix configuration.
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub name: String,
     pub url: String,
 }
 
+/// Select enabled subscriptions, optionally filtering by configured names.
+///
+/// # Errors
+///
+/// Returns an error for absent, invalid, duplicated, disabled, or unknown subscriptions.
 pub fn select_subscriptions(
     settings: &RssSettings,
     requested: &[String],
