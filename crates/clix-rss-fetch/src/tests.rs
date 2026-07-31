@@ -147,6 +147,7 @@ fn sanitizes_active_html_before_rendering_feed_summaries() {
 fn subscription_selection_honors_enabled_names_and_validates_duplicates() {
     let settings = RssSettings {
         output: None,
+        state: None,
         limit: None,
         feeds: vec![
             RssFeedSettings {
@@ -220,6 +221,7 @@ async fn configured_subscription_fetches_and_writes_json_end_to_end() {
     let settings = clix_core::settings::Settings {
         rss: RssSettings {
             output: Some(output.clone()),
+            state: None,
             limit: Some(2),
             feeds: vec![RssFeedSettings {
                 name: "Local".to_string(),

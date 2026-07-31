@@ -232,6 +232,7 @@ dependencies = [
  "clix-core",
  "clix-gh-stars",
  "clix-rss-fetch",
+ "clix-rss-sync",
  "clix-wx-read",
  "clix-x-bookmarks",
  "clix-x-read",
@@ -289,6 +290,22 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-rss-api",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "clix-rss-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clix-core",
+ "clix-rss-api",
+ "redb",
  "serde",
  "serde_json",
  "tempfile",

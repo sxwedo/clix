@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
 use clix_rss_fetch::FetchArgs;
+use clix_rss_sync::SyncArgs;
 use clix_x_bookmarks::BookmarksArgs;
 use clix_x_read::ReadArgs;
 
@@ -60,6 +61,8 @@ enum GhCommands {
 enum RssCommands {
     /// Fetch configured subscriptions into one Markdown or JSON snapshot
     Fetch(FetchArgs),
+    /// Incrementally sync configured subscriptions into a redb database
+    Sync(SyncArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,6 +105,7 @@ fn run(cli: Cli) -> Result<()> {
             run_async(async move {
                 match command {
                     RssCommands::Fetch(args) => clix_rss_fetch::run(args, &settings).await,
+                    RssCommands::Sync(args) => clix_rss_sync::run(args, &settings).await,
                 }
             })
         }
@@ -200,6 +204,31 @@ mod tests {
             } if args.feeds == ["Rust Blog"]
                 && args.format == Some(clix_rss_fetch::OutputFormat::Json)
                 && args.output.as_deref() == Some(std::path::Path::new("rss.json"))
+        ));
+    }
+
+    #[test]
+    fn parses_the_documented_rss_sync_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "rss",
+            "sync",
+            "--feed",
+            "Rust Blog",
+            "--state",
+            "feeds.redb",
+            "--limit",
+            "50",
+        ])
+        .expect("documented RSS sync arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::Sync(args)
+            } if args.feeds == ["Rust Blog"]
+                && args.state.as_deref() == Some(std::path::Path::new("feeds.redb"))
+                && args.limit == Some(50)
         ));
     }
 

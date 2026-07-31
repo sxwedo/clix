@@ -40,6 +40,8 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # Default output path. Relative paths are resolved from the current directory.
 # The .json extension selects JSON; every other extension defaults to Markdown.
 # output = \"rss.md\"
+# Incremental sync database (default: ~/.config/clix/rss.redb).
+# state = \"/absolute/path/to/rss.redb\"
 # Maximum entries kept from each feed (default: 20).
 # limit = 20
 
@@ -85,6 +87,9 @@ pub struct RssSettings {
     /// Default export path. Relative paths use the caller's current directory.
     #[serde(default)]
     pub output: Option<PathBuf>,
+    /// Incremental sync database. Relative paths use the caller's current directory.
+    #[serde(default)]
+    pub state: Option<PathBuf>,
     /// Default maximum number of entries retained from each feed.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -204,6 +209,7 @@ mod tests {
         assert!(settings.x.auth_token.is_none());
         assert!(settings.x.ct0.is_none());
         assert!(settings.rss.output.is_none());
+        assert!(settings.rss.state.is_none());
         assert!(settings.rss.limit.is_none());
         assert!(settings.rss.feeds.is_empty());
     }
@@ -235,6 +241,7 @@ auth_token = \"abc\"
         let text = r#"
 [rss]
 output = "news.json"
+state = "/tmp/rss.redb"
 limit = 12
 
 [[rss.feeds]]
@@ -250,6 +257,10 @@ enabled = false
         assert_eq!(
             settings.rss.output.as_deref(),
             Some(std::path::Path::new("news.json"))
+        );
+        assert_eq!(
+            settings.rss.state.as_deref(),
+            Some(std::path::Path::new("/tmp/rss.redb"))
         );
         assert_eq!(settings.rss.limit, Some(12));
         assert_eq!(settings.rss.feeds.len(), 2);
