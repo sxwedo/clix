@@ -23,7 +23,7 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
-- 📰 **RSS Tools (`clix rss`)**: Export RSS, Atom, or JSON Feed snapshots, or incrementally sync normalized entries into a durable redb database.
+- 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect the local archive, and export it to Markdown or JSON.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
@@ -39,7 +39,10 @@ clix/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-rss-api/      # Shared RSS selection, fetching, and normalization
+│   ├── clix-rss-export/   # Local redb archive to Markdown/JSON exporter
 │   ├── clix-rss-fetch/    # Config-driven RSS/Atom/JSON Feed snapshot exporter
+│   ├── clix-rss-list/     # Compact terminal view of stored RSS entries
+│   ├── clix-rss-store/    # Shared redb persistence and archive querying
 │   ├── clix-rss-sync/     # Incremental RSS entry store backed by redb
 │   ├── clix-wx-read/      # WeChat Official Account article reader
 │   ├── clix-x-api/        # Shared X auth, GraphQL parsing, and content/media types
@@ -135,6 +138,54 @@ clix-rss-sync --feed "Rust Blog"
 ```
 
 Choose the polling interval and `--limit` together. If a source publishes more than `limit` entries between two polls, older unseen entries may no longer be present in the feed and cannot be recovered by the next sync. The database stores normalized feed metadata, the article URL, and the feed-provided summary/content excerpt—not the full linked article.
+
+#### 📚 `clix rss list` / `clix-rss-list` — Local Archive View
+
+Read the local redb database without requesting any RSS source and print a compact newest-first view:
+
+```sh
+# Show the newest 20 stored entries
+clix rss list
+
+# Filter by stored subscription name and change the global display limit
+clix rss list --feed "Hacker News" --limit 50
+
+# Read a non-default database
+clix-rss-list --state ./feeds.redb
+```
+
+The heading reports how many entries are displayed, how many matched the filter before the limit, and how many are stored in the whole database.
+
+#### 📤 `clix rss export` / `clix-rss-export` — Local Archive Export
+
+Export entries already stored in redb to an atomically written Markdown or JSON file. This command does not access the network:
+
+```sh
+# Export the complete local archive
+clix rss export --format markdown --output rss-archive.md
+clix rss export --format json --output rss-archive.json
+
+# Export one feed, newest 100 matching entries
+clix rss export --feed "Hacker News" --limit 100 -o hacker-news.json
+
+# Export entries published or first observed during the last seven days
+clix rss export --since 7d -o weekly-rss.md
+
+# Absolute RFC 3339 timestamps are also supported
+clix rss export --since "2026-07-01T00:00:00+08:00" -o july-rss.json
+```
+
+`--since` accepts `30m`, `24h`, `7d`, `2w`, or an RFC 3339 timestamp. Entries are ordered newest first by publication time, falling back to `first_seen_at` when the feed provides no publication time. `--limit` is applied globally after filtering and sorting. The exporter refuses to overwrite its redb input file.
+
+The intended persistent workflow is:
+
+```sh
+clix rss sync
+clix rss list
+clix rss export --since 7d -o weekly-rss.md
+```
+
+Use `clix rss fetch` only for a one-off live snapshot that should not read or update the archive.
 
 ---
 
@@ -274,7 +325,7 @@ Each credential is resolved with the following priority (highest first):
 
 ### Persistent State
 
-Incremental state is stored in [redb](https://github.com/cberner/redb) key-value databases with transactional writes.
+Incremental state is stored in [redb](https://github.com/cberner/redb) key-value databases with transactional writes. RSS `list` and `export` open the existing database read-only at the command level and never create a missing archive silently.
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -293,7 +344,9 @@ cargo build --workspace --release
 
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
+# - clix-rss-export    (Standalone local RSS archive exporter)
 # - clix-rss-fetch     (Standalone RSS subscription fetcher)
+# - clix-rss-list      (Standalone local RSS archive list)
 # - clix-rss-sync      (Standalone incremental RSS redb sync)
 # - clix-wx-read       (Standalone WeChat Article CLI)
 # - clix-gh-stars      (Standalone GitHub Stars CLI)
