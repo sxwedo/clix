@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
+use clix_rss_export::ExportArgs;
 use clix_rss_fetch::FetchArgs;
 use clix_rss_list::ListArgs;
 use clix_rss_sync::SyncArgs;
@@ -60,6 +61,8 @@ enum GhCommands {
 
 #[derive(Debug, Subcommand)]
 enum RssCommands {
+    /// Export stored entries from redb to Markdown or JSON
+    Export(ExportArgs),
     /// Fetch configured subscriptions into one Markdown or JSON snapshot
     Fetch(FetchArgs),
     /// List newest entries stored in the local redb database
@@ -106,6 +109,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Rss { command } => {
             let settings = clix_core::settings::Settings::load()?;
             match command {
+                RssCommands::Export(args) => clix_rss_export::run(args, &settings),
                 RssCommands::Fetch(args) => {
                     run_async(async move { clix_rss_fetch::run(args, &settings).await })
                 }
@@ -209,6 +213,34 @@ mod tests {
                 command: RssCommands::Fetch(args)
             } if args.feeds == ["Rust Blog"]
                 && args.format == Some(clix_rss_fetch::OutputFormat::Json)
+                && args.output.as_deref() == Some(std::path::Path::new("rss.json"))
+        ));
+    }
+
+    #[test]
+    fn parses_the_documented_rss_export_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "rss",
+            "export",
+            "--feed",
+            "Rust Blog",
+            "--since",
+            "7d",
+            "--format",
+            "json",
+            "--output",
+            "rss.json",
+        ])
+        .expect("documented RSS export arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Rss {
+                command: RssCommands::Export(args)
+            } if args.feeds == ["Rust Blog"]
+                && args.since.as_deref() == Some("7d")
+                && args.format == Some(clix_rss_export::OutputFormat::Json)
                 && args.output.as_deref() == Some(std::path::Path::new("rss.json"))
         ));
     }

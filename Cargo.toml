@@ -4,6 +4,7 @@ members = [
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-rss-api",
+    "crates/clix-rss-export",
     "crates/clix-rss-fetch",
     "crates/clix-rss-list",
     "crates/clix-rss-store",
@@ -56,6 +57,7 @@ anyhow.workspace = true
 clap.workspace = true
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
+clix-rss-export = { path = "crates/clix-rss-export" }
 clix-rss-fetch = { path = "crates/clix-rss-fetch" }
 clix-rss-list = { path = "crates/clix-rss-list" }
 clix-rss-sync = { path = "crates/clix-rss-sync" }

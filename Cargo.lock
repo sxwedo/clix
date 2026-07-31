@@ -231,6 +231,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-gh-stars",
+ "clix-rss-export",
  "clix-rss-fetch",
  "clix-rss-list",
  "clix-rss-sync",
@@ -280,6 +281,21 @@ dependencies = [
  "reqwest",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "clix-rss-export"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clix-core",
+ "clix-rss-api",
+ "clix-rss-store",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
