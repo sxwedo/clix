@@ -553,28 +553,63 @@ fn validate_upsert_schema(schema: &TableSchema, request: &UpsertRequest) -> Resu
         .iter()
         .map(|field| (field.name.as_str(), field.field_type))
         .collect::<HashMap<_, _>>();
+    let mut issues = Vec::new();
     for technical in [&request.key_field, &request.hash_field] {
         match fields.get(technical.as_str()) {
             Some(1) => {}
-            Some(actual) => bail!(
-                "Lark Base field `{technical}` has type {actual}, expected multi-line text type 1"
-            ),
-            None => bail!("Lark Base is missing required field `{technical}`"),
+            Some(actual) => issues.push(format!(
+                "field `{technical}` has type {actual}, expected text type 1"
+            )),
+            None => issues.push(format!(
+                "missing required text field `{technical}` (type 1)"
+            )),
         }
     }
+
+    let mut mapped_fields = BTreeMap::new();
     for record in &request.records {
         for (name, value) in &record.fields {
-            match fields.get(name.as_str()) {
-                Some(actual) if *actual == value.field_type() => {}
-                Some(actual) => bail!(
-                    "Lark Base field `{name}` has type {actual}, expected type {}",
-                    value.field_type()
-                ),
-                None => bail!("Lark Base is missing mapped field `{name}`"),
+            let expected = value.field_type();
+            if let Some(previous) = mapped_fields.insert(name.as_str(), expected)
+                && previous != expected
+            {
+                issues.push(format!(
+                    "mapped field `{name}` receives conflicting expected types {previous} and {expected}"
+                ));
             }
         }
     }
-    Ok(())
+    for (name, expected) in mapped_fields {
+        match fields.get(name) {
+            Some(actual) if *actual == expected => {}
+            Some(actual) => issues.push(format!(
+                "field `{name}` has type {actual}, expected {} type {expected}",
+                field_type_name(expected)
+            )),
+            None => issues.push(format!(
+                "missing mapped {} field `{name}` (type {expected})",
+                field_type_name(expected)
+            )),
+        }
+    }
+
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        bail!("Lark Base schema is incompatible: {}", issues.join("; "))
+    }
+}
+
+const fn field_type_name(field_type: u16) -> &'static str {
+    match field_type {
+        1 => "text",
+        2 => "number",
+        4 => "multi-select",
+        5 => "date",
+        7 => "checkbox",
+        15 => "URL",
+        _ => "unknown",
+    }
 }
 
 fn record_fields(
@@ -854,7 +889,7 @@ mod tests {
 
     use super::{
         BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, TableField, TableSchema,
-        UpsertAction, UpsertMode, UpsertRecord, UpsertRequest,
+        UpsertAction, UpsertMode, UpsertRecord, UpsertRequest, validate_upsert_schema,
     };
 
     async fn mount_auth(server: &MockServer) {
@@ -947,6 +982,45 @@ mod tests {
             app_token: "app-token".to_string(),
             table_id: "table-id".to_string(),
         }
+    }
+
+    #[test]
+    fn schema_error_reports_every_missing_or_incompatible_field() {
+        let schema = TableSchema {
+            fields: vec![TableField {
+                id: "fld-key".to_string(),
+                name: "RSS Key".to_string(),
+                field_type: 2,
+                ui_type: Some("Number".to_string()),
+                is_primary: false,
+            }],
+        };
+        let request = UpsertRequest {
+            target: target(),
+            key_field: "RSS Key".to_string(),
+            hash_field: "Payload Hash".to_string(),
+            mode: UpsertMode::Apply,
+            records: vec![UpsertRecord {
+                key: "one".to_string(),
+                payload_hash: "hash-one".to_string(),
+                fields: BTreeMap::from([
+                    (
+                        "发布时间".to_string(),
+                        BaseValue::DateTime(1_753_952_400_000),
+                    ),
+                    ("标题".to_string(), BaseValue::Text("One".to_string())),
+                ]),
+            }],
+        };
+
+        let error = validate_upsert_schema(&schema, &request)
+            .expect_err("schema should report all incompatibilities");
+        let message = error.to_string();
+
+        assert!(message.contains("`RSS Key` has type 2, expected text type 1"));
+        assert!(message.contains("missing required text field `Payload Hash`"));
+        assert!(message.contains("missing mapped date field `发布时间` (type 5)"));
+        assert!(message.contains("missing mapped text field `标题` (type 1)"));
     }
 
     #[tokio::test]

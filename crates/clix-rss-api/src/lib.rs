@@ -15,7 +15,7 @@ pub use subscription::{Subscription, select_subscriptions};
 /// Default number of recent entries fetched from each subscription.
 pub const DEFAULT_ENTRY_LIMIT: usize = 20;
 
-/// Build the bounded HTTP client shared by RSS snapshot and sync commands.
+/// Build the bounded HTTP client used by RSS sync.
 ///
 /// # Errors
 ///
@@ -29,3 +29,6 @@ pub fn build_client() -> Result<reqwest::Client> {
         .build()
         .context("failed to build RSS HTTP client")
 }
+
+#[cfg(test)]
+mod tests;

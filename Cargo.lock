@@ -250,10 +250,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-gh-stars",
- "clix-rss-export",
- "clix-rss-fetch",
  "clix-rss-list",
- "clix-rss-push",
  "clix-rss-sync",
  "clix-wx-read",
  "clix-x-bookmarks",
@@ -316,33 +313,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "clix-rss-export"
+name = "clix-rss-delivery"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
  "clix-core",
+ "clix-lark-base",
  "clix-rss-api",
  "clix-rss-store",
+ "fs2",
  "serde",
  "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "clix-rss-fetch"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "clix-core",
- "clix-rss-api",
- "serde",
- "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -355,26 +341,6 @@ dependencies = [
  "clix-rss-api",
  "clix-rss-store",
  "tempfile",
-]
-
-[[package]]
-name = "clix-rss-push"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "clix-core",
- "clix-lark-base",
- "clix-rss-api",
- "clix-rss-store",
- "fs2",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "toml",
 ]
 
 [[package]]
@@ -400,7 +366,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-rss-api",
- "clix-rss-push",
+ "clix-rss-delivery",
  "clix-rss-store",
  "tempfile",
  "tokio",

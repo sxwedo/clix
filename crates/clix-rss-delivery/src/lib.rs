@@ -1,4 +1,4 @@
-//! Reliable delivery of stored RSS entries to configured destinations.
+//! Internal reliable delivery of stored RSS entries to configured destinations.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -9,44 +9,27 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
-use clap::Args;
 use clix_core::{settings::RssDestinationSettings, ui};
 use clix_lark_base::{
     BaseFieldType, BaseTarget, BaseValue, LarkBaseClient, LarkCredentials, UpsertMode,
     UpsertRecord, UpsertReport, UpsertRequest,
 };
-use clix_rss_store::{
-    DeliveryCheckpoint, DeliveryOutcome, EntryQuery, RssStore, StoredEntry, default_state_path,
-};
+use clix_rss_store::{DeliveryCheckpoint, DeliveryOutcome, EntryQuery, RssStore, StoredEntry};
 use fs2::FileExt as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// Arguments accepted by `clix rss push` and `clix-rss-push`.
-#[derive(Debug, Clone, Args)]
-pub struct PushArgs {
+/// Entries selected for an internal destination delivery after local sync.
+#[derive(Debug, Clone)]
+pub struct DeliveryRequest {
     /// Named entry in `[rss.destinations]`
     pub destination: String,
 
-    /// redb database path (default: configured `[rss].state` or `~/.config/clix/rss.redb`)
-    #[arg(long, value_name = "PATH")]
-    pub state: Option<PathBuf>,
+    /// redb database path committed by the current sync.
+    pub state: PathBuf,
 
-    /// Push only named stored subscriptions; repeat or use comma-separated names
-    #[arg(long = "feed", value_name = "NAME", value_delimiter = ',')]
+    /// Deliver only these stored subscriptions; empty selects all subscriptions.
     pub feeds: Vec<String>,
-
-    /// Maximum newest matching entries considered
-    #[arg(short = 'n', long, value_name = "COUNT")]
-    pub limit: Option<usize>,
-
-    /// Validate and show planned changes without writing or checkpointing
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Reconcile every matching entry even when its local checkpoint is current
-    #[arg(long)]
-    pub force: bool,
 }
 
 trait BaseUpserter: Sync {
@@ -59,27 +42,30 @@ impl BaseUpserter for LarkBaseClient {
     }
 }
 
-/// Push stored RSS entries to one configured destination.
+/// Deliver stored RSS entries to one configured destination.
 ///
 /// # Errors
 ///
 /// Returns an error for invalid configuration, an absent state database,
-/// invalid stored entries, a concurrent push, remote failures, or checkpoint
+/// invalid stored entries, a concurrent delivery, remote failures, or checkpoint
 /// failures.
-pub async fn run(args: PushArgs, settings: &clix_core::settings::Settings) -> Result<()> {
-    let destination = ResolvedDestination::resolve(settings, &args.destination)?;
+pub async fn deliver(
+    request: DeliveryRequest,
+    settings: &clix_core::settings::Settings,
+) -> Result<()> {
+    let destination = ResolvedDestination::resolve(settings, &request.destination)?;
     let client = LarkBaseClient::new(destination.credentials.clone())?;
-    execute(args, settings, &destination, &client).await
+    execute(request, &destination, &client).await
 }
 
 #[cfg(test)]
-async fn run_with<U: BaseUpserter>(
-    args: PushArgs,
+async fn deliver_with<U: BaseUpserter>(
+    request: DeliveryRequest,
     settings: &clix_core::settings::Settings,
     upserter: &U,
 ) -> Result<()> {
-    let destination = ResolvedDestination::resolve(settings, &args.destination)?;
-    execute(args, settings, &destination, upserter).await
+    let destination = ResolvedDestination::resolve(settings, &request.destination)?;
+    execute(request, &destination, upserter).await
 }
 
 struct ResolvedDestination {
@@ -109,19 +95,44 @@ impl ResolvedDestination {
             hash_field,
             fields,
         } = configured;
+        require_non_blank(base, &format!("[rss.destinations.{name}].base"))?;
         let base_settings = settings.lark.bases.get(base).with_context(|| {
-            format!("RSS destination `{name}` references unknown Lark Base `{base}`")
+            format!(
+                "missing `[lark.bases.{base}]` in {} (referenced by `[rss.destinations.{name}].base`)",
+                clix_core::settings::config_path().display()
+            )
         })?;
+        require_non_blank(
+            &base_settings.account,
+            &format!("[lark.bases.{base}].account"),
+        )?;
+        require_non_blank(
+            &base_settings.app_token,
+            &format!("[lark.bases.{base}].app_token"),
+        )?;
+        require_non_blank(
+            &base_settings.table_id,
+            &format!("[lark.bases.{base}].table_id"),
+        )?;
         let account = settings
             .lark
             .accounts
             .get(&base_settings.account)
             .with_context(|| {
                 format!(
-                    "Lark Base `{base}` references unknown account `{}`",
-                    base_settings.account
+                    "missing `[lark.accounts.{}]` in {} (referenced by `[lark.bases.{base}].account`)",
+                    base_settings.account,
+                    clix_core::settings::config_path().display()
                 )
             })?;
+        require_non_blank(
+            &account.app_id,
+            &format!("[lark.accounts.{}].app_id", base_settings.account),
+        )?;
+        require_non_blank(
+            &account.app_secret,
+            &format!("[lark.accounts.{}].app_secret", base_settings.account),
+        )?;
         validate_destination_fields(name, key_field, hash_field, fields)?;
 
         let target_fingerprint = hash_value(&serde_json::json!({
@@ -151,23 +162,17 @@ impl ResolvedDestination {
 }
 
 async fn execute<U: BaseUpserter>(
-    args: PushArgs,
-    settings: &clix_core::settings::Settings,
+    request: DeliveryRequest,
     destination: &ResolvedDestination,
     upserter: &U,
 ) -> Result<()> {
-    let state_path = args
-        .state
-        .or_else(|| settings.rss.state.clone())
-        .unwrap_or_else(default_state_path);
-    let _lock = (!args.dry_run)
-        .then(|| acquire_delivery_lock(&state_path))
-        .transpose()?;
+    let state_path = request.state;
+    let _lock = acquire_delivery_lock(&state_path)?;
     let store = RssStore::open(&state_path)?;
     let result = store.query(&EntryQuery {
-        feeds: args.feeds,
+        feeds: request.feeds,
         since: None,
-        limit: args.limit,
+        limit: None,
     })?;
     let prepared = result
         .entries
@@ -176,16 +181,15 @@ async fn execute<U: BaseUpserter>(
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .filter(|prepared| {
-            args.force
-                || prepared
-                    .stored
-                    .delivery_state(&destination.name)
-                    .is_none_or(|state| {
-                        !state.confirms(
-                            &destination.target_fingerprint,
-                            &prepared.record.payload_hash,
-                        )
-                    })
+            prepared
+                .stored
+                .delivery_state(&destination.name)
+                .is_none_or(|state| {
+                    !state.confirms(
+                        &destination.target_fingerprint,
+                        &prepared.record.payload_hash,
+                    )
+                })
         })
         .collect::<Vec<_>>();
 
@@ -202,11 +206,7 @@ async fn execute<U: BaseUpserter>(
         target: destination.target.clone(),
         key_field: destination.key_field.clone(),
         hash_field: destination.hash_field.clone(),
-        mode: if args.dry_run {
-            UpsertMode::DryRun
-        } else {
-            UpsertMode::Apply
-        },
+        mode: UpsertMode::Apply,
         records: prepared
             .iter()
             .map(|prepared| prepared.record.clone())
@@ -215,34 +215,31 @@ async fn execute<U: BaseUpserter>(
     let report = match upserter.upsert(request).await {
         Ok(report) => report,
         Err(error) => {
-            if !args.dry_run {
-                let summary = bounded_error(&error.to_string());
-                let checkpoints = prepared
-                    .iter()
-                    .map(|prepared| {
-                        checkpoint(
-                            prepared,
-                            destination,
-                            &attempted_at,
-                            DeliveryOutcome::Failed {
-                                error: summary.clone(),
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                store
-                    .record_delivery_outcomes(&checkpoints)
-                    .context("remote push failed and its failure checkpoint could not be saved")?;
-            }
-            return Err(error)
-                .with_context(|| format!("failed to push RSS destination {}", destination.name));
+            let summary = bounded_error(&error.to_string());
+            let checkpoints = prepared
+                .iter()
+                .map(|prepared| {
+                    checkpoint(
+                        prepared,
+                        destination,
+                        &attempted_at,
+                        DeliveryOutcome::Failed {
+                            error: summary.clone(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            store
+                .record_delivery_outcomes(&checkpoints)
+                .context("remote delivery failed and its failure checkpoint could not be saved")?;
+            return Err(error).with_context(|| {
+                format!("failed to deliver RSS destination {}", destination.name)
+            });
         }
     };
 
-    if !args.dry_run {
-        persist_successes(&store, &prepared, destination, &attempted_at, &report)?;
-    }
-    print_report(destination, &state_path, &report, args.dry_run);
+    persist_successes(&store, &prepared, destination, &attempted_at, &report)?;
+    print_report(destination, &state_path, &report);
     Ok(())
 }
 
@@ -399,25 +396,40 @@ fn checkpoint(
     }
 }
 
+fn require_non_blank(value: &str, config_key: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("`{config_key}` must not be blank");
+    }
+    Ok(())
+}
+
 fn validate_destination_fields(
     destination: &str,
     key_field: &str,
     hash_field: &str,
     fields: &BTreeMap<String, String>,
 ) -> Result<()> {
-    if key_field.trim().is_empty() || hash_field.trim().is_empty() {
-        bail!("RSS destination `{destination}` key_field and hash_field must not be blank");
-    }
+    require_non_blank(
+        key_field,
+        &format!("[rss.destinations.{destination}].key_field"),
+    )?;
+    require_non_blank(
+        hash_field,
+        &format!("[rss.destinations.{destination}].hash_field"),
+    )?;
     if key_field == hash_field {
         bail!("RSS destination `{destination}` key_field and hash_field must differ");
     }
     if fields.is_empty() {
-        bail!("RSS destination `{destination}` must map at least one RSS field");
+        bail!("`[rss.destinations.{destination}.fields]` must map at least one RSS field");
     }
     let mut targets = HashSet::new();
     for (source, target) in fields {
-        if source.trim().is_empty() || target.trim().is_empty() {
-            bail!("RSS destination `{destination}` field mappings must not be blank");
+        if source.trim().is_empty() {
+            bail!("`[rss.destinations.{destination}.fields]` contains a blank RSS field name");
+        }
+        if target.trim().is_empty() {
+            bail!("`[rss.destinations.{destination}.fields].{source}` must not be blank");
         }
         if target == key_field || target == hash_field {
             bail!(
@@ -440,7 +452,8 @@ fn unknown_destination_message(settings: &clix_core::settings::Settings, name: &
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "unknown RSS destination `{name}`. Configured destinations: {}",
+        "missing `[rss.destinations.{name}]` in {}. Add that table or remove `{name}` from `[rss].push_to`. Configured destinations: {}",
+        clix_core::settings::config_path().display(),
         if available.is_empty() {
             "<none>"
         } else {
@@ -456,7 +469,7 @@ fn hash_value(value: &impl Serialize) -> Result<String> {
 
 fn acquire_delivery_lock(state_path: &Path) -> Result<File> {
     let mut lock_name = state_path.as_os_str().to_os_string();
-    lock_name.push(".push.lock");
+    lock_name.push(".delivery.lock");
     let lock_path = PathBuf::from(lock_name);
     let file = OpenOptions::new()
         .create(true)
@@ -464,10 +477,10 @@ fn acquire_delivery_lock(state_path: &Path) -> Result<File> {
         .write(true)
         .truncate(false)
         .open(&lock_path)
-        .with_context(|| format!("failed to open RSS push lock {}", lock_path.display()))?;
+        .with_context(|| format!("failed to open RSS delivery lock {}", lock_path.display()))?;
     file.try_lock_exclusive().with_context(|| {
         format!(
-            "another RSS push is already running for {}",
+            "another RSS delivery is already running for {}",
             state_path.display()
         )
     })?;
@@ -485,21 +498,14 @@ fn bounded_error(value: &str) -> String {
     result
 }
 
-fn print_report(
-    destination: &ResolvedDestination,
-    state_path: &Path,
-    report: &UpsertReport,
-    dry_run: bool,
-) {
-    let prefix = if dry_run { "would push" } else { "pushed" };
+fn print_report(destination: &ResolvedDestination, state_path: &Path, report: &UpsertReport) {
     ui::success(format!(
-        "{prefix} {} created, {} updated, {} unchanged RSS entries from {} to {}{}",
+        "delivered {} created, {} updated, {} unchanged RSS entries from {} to {}",
         ui::style_bold(&report.created.to_string()),
         ui::style_bold(&report.updated.to_string()),
         ui::style_bold(&report.unchanged.to_string()),
         ui::style_bold(&state_path.display().to_string()),
         ui::style_bold(&destination.name),
-        if dry_run { " (dry run)" } else { "" }
     ));
 }
 
@@ -554,8 +560,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn missing_lark_base_error_names_the_exact_required_table() {
+        let settings: clix_core::settings::Settings = toml::from_str(
+            r#"
+[rss.destinations.news]
+type = "lark_base"
+base = "rss_news"
+key_field = "RSS Key"
+hash_field = "Payload Hash"
+
+[rss.destinations.news.fields]
+title = "标题"
+"#,
+        )
+        .expect("settings");
+
+        let error = ResolvedDestination::resolve(&settings, "news")
+            .err()
+            .expect("base should be required");
+
+        assert!(
+            error
+                .to_string()
+                .contains("missing `[lark.bases.rss_news]`")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("referenced by `[rss.destinations.news].base`")
+        );
+    }
+
+    #[test]
+    fn blank_lark_secret_error_names_the_exact_required_key() {
+        let settings: clix_core::settings::Settings = toml::from_str(
+            r#"
+[lark.accounts.default]
+app_id = "cli_test"
+app_secret = " "
+
+[lark.bases.rss_news]
+account = "default"
+app_token = "app-token"
+table_id = "table-id"
+
+[rss.destinations.news]
+type = "lark_base"
+base = "rss_news"
+key_field = "RSS Key"
+hash_field = "Payload Hash"
+
+[rss.destinations.news.fields]
+title = "标题"
+"#,
+        )
+        .expect("settings");
+
+        let error = ResolvedDestination::resolve(&settings, "news")
+            .err()
+            .expect("secret should be required");
+
+        assert!(
+            error
+                .to_string()
+                .contains("`[lark.accounts.default].app_secret` must not be blank")
+        );
+    }
+
     #[tokio::test]
-    async fn successful_push_checkpoints_the_entry_and_next_push_is_local_noop() {
+    async fn successful_delivery_checkpoints_the_entry_and_next_delivery_is_local_noop() {
         let directory = tempfile::tempdir().expect("temp dir");
         let state = directory.path().join("rss.redb");
         let store = RssStore::open_or_create(&state).expect("store");
@@ -589,24 +663,17 @@ title = "标题"
             state.display()
         ))
         .expect("settings");
-        let args = PushArgs {
-            destination: "news".to_string(),
-            state: None,
-            feeds: Vec::new(),
-            limit: None,
-            dry_run: false,
-            force: false,
-        };
+        let request = delivery_request(&state);
         let upserter = RecordingUpserter {
             requests: Mutex::new(Vec::new()),
         };
 
-        run_with(args.clone(), &settings, &upserter)
+        deliver_with(request.clone(), &settings, &upserter)
             .await
-            .expect("first push");
-        run_with(args, &settings, &RejectingUpserter)
+            .expect("first delivery");
+        deliver_with(request, &settings, &RejectingUpserter)
             .await
-            .expect("second push");
+            .expect("second delivery");
 
         let entry = &RssStore::open(&state)
             .expect("reopen")
@@ -628,7 +695,7 @@ title = "标题"
     }
 
     #[tokio::test]
-    async fn failed_push_is_checkpointed_and_remains_eligible_for_retry() {
+    async fn failed_delivery_is_checkpointed_and_remains_eligible_for_retry() {
         let directory = tempfile::tempdir().expect("temp dir");
         let state = directory.path().join("rss.redb");
         let store = RssStore::open_or_create(&state).expect("store");
@@ -637,12 +704,16 @@ title = "标题"
             .expect("seed");
         drop(store);
         let settings = settings(&state);
-        let args = push_args();
+        let request = delivery_request(&state);
 
-        let error = run_with(args.clone(), &settings, &FailingUpserter)
+        let error = deliver_with(request.clone(), &settings, &FailingUpserter)
             .await
-            .expect_err("first push should fail");
-        assert!(error.to_string().contains("failed to push RSS destination"));
+            .expect_err("first delivery should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to deliver RSS destination")
+        );
         let failed = delivery(&state);
         assert_eq!(failed.status, clix_rss_store::DeliveryStatus::Failed);
         assert_eq!(failed.attempts, 1);
@@ -654,7 +725,7 @@ title = "标题"
         let retry = RecordingUpserter {
             requests: Mutex::new(Vec::new()),
         };
-        run_with(args, &settings, &retry)
+        deliver_with(request, &settings, &retry)
             .await
             .expect("retry should succeed");
         let succeeded = delivery(&state);
@@ -685,9 +756,9 @@ title = "标题"
             requests: Mutex::new(Vec::new()),
         };
 
-        run_with(push_args(), &settings, &upserter)
+        deliver_with(delivery_request(&state), &settings, &upserter)
             .await
-            .expect("push");
+            .expect("delivery");
 
         let requests = upserter.requests.lock().expect("requests");
         let fields = requests[0].records[0].fields.clone();
@@ -735,14 +806,11 @@ title = "标题"
         .expect("settings")
     }
 
-    fn push_args() -> PushArgs {
-        PushArgs {
+    fn delivery_request(state: &Path) -> DeliveryRequest {
+        DeliveryRequest {
             destination: "news".to_string(),
-            state: None,
+            state: state.to_path_buf(),
             feeds: Vec::new(),
-            limit: None,
-            dry_run: false,
-            force: false,
         }
     }
 

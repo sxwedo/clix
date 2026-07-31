@@ -1,20 +1,6 @@
-use std::{
-    fs,
-    io::{Read, Write},
-    net::TcpListener,
-    path::Path,
-    thread,
-};
-
 use clix_core::settings::{RssFeedSettings, RssSettings};
-use clix_rss_api::{Subscription, parse_feed, select_subscriptions};
 
-use crate::{
-    FetchArgs, OutputFormat,
-    model::RssExport,
-    output::{render_markdown, resolve_format},
-    run,
-};
+use crate::{Subscription, parse_feed, select_subscriptions};
 
 const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -24,18 +10,16 @@ const RSS_FIXTURE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <description>Example feed</description>
     <item>
       <guid>newer</guid>
-      <title>Newer [entry]</title>
+      <title>Newer entry</title>
       <link>https://example.com/newer</link>
       <description><![CDATA[<p>A <strong>new</strong> summary.</p>]]></description>
       <dc:creator>Ada</dc:creator>
-      <category>Rust</category>
       <pubDate>Wed, 30 Jul 2025 10:00:00 GMT</pubDate>
     </item>
     <item>
       <guid>older</guid>
       <title>Older entry</title>
       <link>https://example.com/older</link>
-      <description>Older summary.</description>
       <pubDate>Tue, 29 Jul 2025 10:00:00 GMT</pubDate>
     </item>
   </channel>
@@ -82,13 +66,14 @@ fn subscription(name: &str, url: &str) -> Subscription {
 }
 
 #[test]
-fn parses_rss_orders_entries_and_renders_safe_markdown() {
+fn parses_and_limits_rss_through_the_shared_interface() {
     let feed = parse_feed(
         &subscription("Example", "https://example.com/feed.xml"),
         RSS_FIXTURE.as_bytes(),
         1,
     )
     .expect("RSS should parse");
+
     assert_eq!(feed.title, "Example News");
     assert_eq!(feed.entries.len(), 1);
     assert_eq!(feed.entries[0].id, "newer");
@@ -97,26 +82,17 @@ fn parses_rss_orders_entries_and_renders_safe_markdown() {
         feed.entries[0].summary.as_deref(),
         Some("A **new** summary.")
     );
-
-    let export = RssExport {
-        fetched_at: "2025-07-30T12:00:00Z".to_string(),
-        feed_count: 1,
-        entry_count: 1,
-        feeds: vec![feed],
-    };
-    let markdown = render_markdown(&export).expect("Markdown should render");
-    assert!(markdown.contains("### [Newer \\[entry\\]](<https://example.com/newer>)"));
-    assert!(markdown.contains("> A **new** summary."));
 }
 
 #[test]
-fn parses_atom_through_the_same_normalized_interface() {
+fn parses_atom_through_the_shared_interface() {
     let feed = parse_feed(
-        &subscription("Atom", "https://example.net/feed.xml"),
+        &subscription("Atom", "https://example.net/feed"),
         ATOM_FIXTURE.as_bytes(),
         10,
     )
     .expect("Atom should parse");
+
     assert_eq!(feed.title, "Atom News");
     assert_eq!(feed.site_url.as_deref(), Some("https://example.net/"));
     assert_eq!(feed.entries[0].title, "Atom entry");
@@ -127,7 +103,7 @@ fn parses_atom_through_the_same_normalized_interface() {
 }
 
 #[test]
-fn sanitizes_active_html_before_rendering_feed_summaries() {
+fn sanitizes_active_html_before_normalizing_summaries() {
     let feed = parse_feed(
         &subscription("Unsafe", "https://example.com/feed.xml"),
         UNSAFE_HTML_FIXTURE.as_bytes(),
@@ -138,17 +114,15 @@ fn sanitizes_active_html_before_rendering_feed_summaries() {
         .summary
         .as_deref()
         .expect("safe summary should remain");
+
     assert!(summary.contains("Safe summary."));
     assert!(!summary.contains("alert("));
     assert!(!summary.contains("javascript:"));
 }
 
 #[test]
-fn subscription_selection_honors_enabled_names_and_validates_duplicates() {
+fn subscription_selection_honors_enabled_names_and_rejects_duplicates() {
     let settings = RssSettings {
-        output: None,
-        state: None,
-        limit: None,
         feeds: vec![
             RssFeedSettings {
                 name: "One".to_string(),
@@ -185,71 +159,4 @@ fn subscription_selection_honors_enabled_names_and_validates_duplicates() {
         ..RssSettings::default()
     };
     assert!(select_subscriptions(&duplicate, &[]).is_err());
-}
-
-#[test]
-fn output_format_is_inferred_from_the_path_but_explicit_format_wins() {
-    assert_eq!(
-        resolve_format(None, Some(Path::new("feeds.JSON"))),
-        OutputFormat::Json
-    );
-    assert_eq!(
-        resolve_format(Some(OutputFormat::Markdown), Some(Path::new("feeds.json"))),
-        OutputFormat::Markdown
-    );
-    assert_eq!(resolve_format(None, None), OutputFormat::Markdown);
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn configured_subscription_fetches_and_writes_json_end_to_end() {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener");
-    let address = listener.local_addr().expect("listener address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("request");
-        let mut request = [0_u8; 2_048];
-        let _ = stream.read(&mut request).expect("read request");
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            RSS_FIXTURE.len(),
-            RSS_FIXTURE
-        )
-        .expect("write response");
-    });
-
-    let directory = tempfile::tempdir().expect("temp dir");
-    let output = directory.path().join("nested/rss.json");
-    let settings = clix_core::settings::Settings {
-        rss: RssSettings {
-            output: Some(output.clone()),
-            state: None,
-            limit: Some(2),
-            feeds: vec![RssFeedSettings {
-                name: "Local".to_string(),
-                url: format!("http://{address}/feed.xml"),
-                enabled: true,
-            }],
-            ..RssSettings::default()
-        },
-        ..clix_core::settings::Settings::default()
-    };
-    run(
-        FetchArgs {
-            feeds: Vec::new(),
-            output: None,
-            format: None,
-            limit: None,
-        },
-        &settings,
-    )
-    .await
-    .expect("configured fetch should succeed");
-    server.join().expect("server should finish");
-
-    let value: serde_json::Value =
-        serde_json::from_slice(&fs::read(output).expect("JSON output should have been written"))
-            .expect("valid JSON output");
-    assert_eq!(value["feed_count"], 1);
-    assert_eq!(value["entry_count"], 2);
-    assert_eq!(value["feeds"][0]["subscription"], "Local");
 }

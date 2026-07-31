@@ -5,7 +5,7 @@ use chrono::{SecondsFormat, Utc};
 use clap::Args;
 use clix_core::ui;
 use clix_rss_api::{DEFAULT_ENTRY_LIMIT, build_client, fetch_subscriptions, select_subscriptions};
-use clix_rss_push::PushArgs;
+use clix_rss_delivery::DeliveryRequest;
 use clix_rss_store::{RssStore, default_state_path};
 
 /// Arguments accepted by `clix rss sync` and `clix-rss-sync`.
@@ -23,11 +23,11 @@ pub struct SyncArgs {
     #[arg(short = 'n', long, value_name = "COUNT")]
     pub limit: Option<usize>,
 
-    /// Push to these destinations after local sync; overrides configured `[rss].push_to`
+    /// Deliver to these destinations after local sync; overrides configured `[rss].push_to`
     #[arg(long = "push-to", value_name = "DESTINATION", value_delimiter = ',')]
     pub push_to: Vec<String>,
 
-    /// Skip every configured or explicitly requested remote push
+    /// Skip every configured or explicitly requested remote delivery
     #[arg(long, conflicts_with = "push_to")]
     pub no_push: bool,
 }
@@ -38,7 +38,7 @@ pub struct SyncArgs {
 ///
 /// Returns an error when subscriptions are invalid, every selected feed fails,
 /// the state database cannot be opened, the atomic upsert fails, or any
-/// configured destination push fails after the local commit.
+/// configured destination delivery fails after the local commit.
 pub async fn run(args: SyncArgs, settings: &clix_core::settings::Settings) -> Result<()> {
     let push_destinations = select_push_destinations(&args, settings);
     let push_feeds = args.feeds.clone();
@@ -96,7 +96,7 @@ pub async fn run(args: SyncArgs, settings: &clix_core::settings::Settings) -> Re
     ));
     drop(store);
 
-    push_synced_entries(push_destinations, push_feeds, state_path, settings).await
+    deliver_synced_entries(push_destinations, push_feeds, state_path, settings).await
 }
 
 fn select_push_destinations(
@@ -119,7 +119,7 @@ fn select_push_destinations(
         .collect()
 }
 
-async fn push_synced_entries(
+async fn deliver_synced_entries(
     destinations: Vec<String>,
     feeds: Vec<String>,
     state_path: PathBuf,
@@ -127,21 +127,18 @@ async fn push_synced_entries(
 ) -> Result<()> {
     let mut failures = Vec::new();
     for destination in destinations {
-        let result = clix_rss_push::run(
-            PushArgs {
+        let result = clix_rss_delivery::deliver(
+            DeliveryRequest {
                 destination: destination.clone(),
-                state: Some(state_path.clone()),
+                state: state_path.clone(),
                 feeds: feeds.clone(),
-                limit: None,
-                dry_run: false,
-                force: false,
             },
             settings,
         )
         .await;
         if let Err(error) = result {
             ui::warn(format!(
-                "RSS destination {destination} failed after local sync: {error:#}"
+                "RSS destination {destination} delivery failed after local sync: {error:#}"
             ));
             failures.push(format!("{destination}: {error:#}"));
         }
@@ -151,7 +148,7 @@ async fn push_synced_entries(
         Ok(())
     } else {
         bail!(
-            "RSS entries were synced locally, but {} destination push(es) failed: {}",
+            "RSS entries were synced locally, but {} destination delivery attempt(s) failed: {}",
             failures.len(),
             failures.join("; ")
         )

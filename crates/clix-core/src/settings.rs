@@ -49,14 +49,11 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # table_id = \"tblxxxxxxxxxxxx\"
 
 [rss]
-# Default output path. Relative paths are resolved from the current directory.
-# The .json extension selects JSON; every other extension defaults to Markdown.
-# output = \"rss.md\"
 # Incremental sync database (default: ~/.config/clix/rss.redb).
 # state = \"/absolute/path/to/rss.redb\"
 # Maximum entries kept from each feed (default: 20).
 # limit = 20
-# Named destinations automatically pushed after a successful local sync.
+# Named destinations automatically delivered after a successful local sync.
 # push_to = [\"news\"]
 
 # Add one block per subscription. `enabled` defaults to true.
@@ -146,19 +143,16 @@ pub struct LarkBaseSettings {
     pub table_id: String,
 }
 
-/// `[rss]` section: RSS subscriptions and fetch defaults.
+/// `[rss]` section: RSS subscriptions, sync state, and delivery defaults.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct RssSettings {
-    /// Default export path. Relative paths use the caller's current directory.
-    #[serde(default)]
-    pub output: Option<PathBuf>,
     /// Incremental sync database. Relative paths use the caller's current directory.
     #[serde(default)]
     pub state: Option<PathBuf>,
     /// Default maximum number of entries retained from each feed.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Named destinations pushed after a successful local sync.
+    /// Named destinations delivered after a successful local sync.
     #[serde(default)]
     pub push_to: Vec<String>,
     /// Named remote delivery destinations.
@@ -190,11 +184,11 @@ pub enum RssDestinationSettings {
 /// One `[[rss.feeds]]` subscription.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RssFeedSettings {
-    /// Stable human-readable name used by `clix rss fetch --feed`.
+    /// Stable human-readable name used by `clix rss sync --feed`.
     pub name: String,
     /// HTTP(S) URL of the RSS, Atom, or JSON Feed document.
     pub url: String,
-    /// Whether this subscription participates in fetches.
+    /// Whether this subscription participates in syncs.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
 }
@@ -297,7 +291,6 @@ mod tests {
         assert!(settings.github.username.is_none());
         assert!(settings.x.auth_token.is_none());
         assert!(settings.x.ct0.is_none());
-        assert!(settings.rss.output.is_none());
         assert!(settings.rss.state.is_none());
         assert!(settings.rss.limit.is_none());
         assert!(settings.rss.feeds.is_empty());
@@ -329,7 +322,6 @@ auth_token = \"abc\"
     fn rss_subscriptions_parse_with_defaults_and_overrides() {
         let text = r#"
 [rss]
-output = "news.json"
 state = "/tmp/rss.redb"
 limit = 12
 
@@ -343,10 +335,6 @@ url = "https://example.com/feed.xml"
 enabled = false
 "#;
         let settings: Settings = toml::from_str(text).expect("rss config");
-        assert_eq!(
-            settings.rss.output.as_deref(),
-            Some(std::path::Path::new("news.json"))
-        );
         assert_eq!(
             settings.rss.state.as_deref(),
             Some(std::path::Path::new("/tmp/rss.redb"))

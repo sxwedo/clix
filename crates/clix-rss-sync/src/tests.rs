@@ -49,7 +49,6 @@ async fn configured_subscription_syncs_into_redb_and_deduplicates_next_poll() {
     let source_url = format!("http://{address}/feed.xml");
     let settings = clix_core::settings::Settings {
         rss: RssSettings {
-            output: None,
             state: Some(state_path.clone()),
             limit: Some(10),
             feeds: vec![RssFeedSettings {
@@ -151,11 +150,9 @@ async fn local_sync_stays_committed_when_configured_push_fails() {
     .expect_err("unknown configured destination should fail");
     server.join().expect("server should finish");
 
-    assert!(
-        error
-            .to_string()
-            .contains("unknown RSS destination `missing`")
-    );
+    let message = format!("{error:#}");
+    assert!(message.contains("missing `[rss.destinations.missing]`"));
+    assert!(message.contains("remove `missing` from `[rss].push_to`"));
     let result = RssStore::open(&state_path)
         .expect("local sync should already be committed")
         .query(&EntryQuery::default())

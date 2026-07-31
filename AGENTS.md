@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, modular CLI suite written in Rust designed to streamline daily developer tasks, GitHub workflows, social media tools, and system utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss fetch`, `clix rss sync`, `clix rss push`, `clix rss list`, `clix rss export`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss sync`, `clix rss list`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
 - **Zero-Config GitHub Auth**: Falls back through the config file, `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`; usernames come from the config file, the authenticated `gh` account, or `github.user`.
 - **Externalized Configuration**: Credentials and RSS subscriptions live in `~/.config/clix/config.toml` (`clix config init` generates a 0600 template). Credential resolution priority: CLI flags > config file > environment variables > GitHub autodetect.
 
@@ -42,12 +42,10 @@ clix/
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-lark-base/     # Shared authenticated Lark Base schema and upsert interface
   │   ├── clix-rss-api/       # Shared subscription selection, bounded fetching, and normalized models
-  │   ├── clix-rss-export/    # Local redb archive to Markdown/JSON exporter
-  │   ├── clix-rss-fetch/     # Config-driven RSS/Atom/JSON Feed snapshot exporter
+  │   ├── clix-rss-delivery/  # Internal reliable delivery to configured destinations
   │   ├── clix-rss-list/      # Compact terminal view of stored RSS entries
-  │   ├── clix-rss-push/      # Reliable delivery from redb to configured destinations
   │   ├── clix-rss-store/     # Shared redb persistence, filtering, and archive ordering
-  │   ├── clix-rss-sync/      # Local RSS sync followed by configured destination pushes
+  │   ├── clix-rss-sync/      # Local RSS sync followed by configured destination delivery
   │   ├── clix-wx-read/       # WeChat Official Account article reader
   │   ├── clix-x-api/         # Shared X auth, GraphQL parsing, and content/media types
   │   ├── clix-x-bookmarks/   # X bookmarks exporter (redb-backed incremental state)
@@ -59,12 +57,11 @@ clix/
 
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
 - **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.
-- **`clix-rss-fetch` (RSS Snapshot):** Renders shared normalized RSS models and atomically writes Markdown or JSON snapshots.
 - **`clix-lark-base` (Shared Lark Infrastructure):** Owns tenant authentication, schema discovery, paginated record lookup, sequential bounded batches, transient-write retries, and create/update/unchanged planning behind one typed upsert interface.
 - **`clix-rss-store` (RSS Persistence):** Hides the redb table and serialization schema behind `open`, `open_or_create`, `upsert_feeds`, `query`, and delivery checkpoint updates. Each record's extensible `extra` envelope carries per-destination delivery state while RSS refreshes preserve it.
-- **`clix-rss-push` (RSS Delivery):** Maps canonical stored RSS fields into named destinations. Stable entry keys, payload hashes, target fingerprints, and redb checkpoints provide idempotent retry behavior; Lark Base is the first adapter.
-- **`clix-rss-sync` (RSS Incremental State):** Upserts shared normalized entries into `~/.config/clix/rss.redb` by `source_url + entry.id`, then pushes `[rss].push_to` destinations after the local commit. New and changed records are written transactionally, unchanged records are skipped, and disappeared entries remain as history. `--state <path>` overrides the location.
-- **`clix-rss-list` / `clix-rss-export` (RSS Read Views):** Read the shared store without network access. `list` prints a compact terminal view; `export` atomically writes Markdown or JSON with feed, time-range, and global-limit filters.
+- **`clix-rss-delivery` (Internal RSS Delivery):** Maps canonical stored RSS fields into named destinations after a local sync. Stable entry keys, payload hashes, target fingerprints, and redb checkpoints provide idempotent retry behavior; Lark Base is the first adapter. It intentionally exposes no public CLI binary.
+- **`clix-rss-sync` (RSS Incremental State):** Upserts shared normalized entries into `~/.config/clix/rss.redb` by `source_url + entry.id`, then delivers `[rss].push_to` destinations after the local commit. New and changed records are written transactionally, unchanged records are skipped, and disappeared entries remain as history. `--state <path>` overrides the location.
+- **`clix-rss-list` (RSS Read View):** Reads the shared store without network access and prints a compact terminal view.
 - **`clix-x-api` (Shared X Infrastructure):** Owns X credentials (resolving CLI flags + config file + env vars), HTTP client setup, GraphQL parsing, media helpers, and the common content taxonomy.
 - **`clix-x-bookmarks` (Incremental State):** Dedup state persists in a redb database (`state.rs`) at `~/.config/clix/bookmarks.redb` by default; legacy JSON sidecars auto-migrate. `--state <path>.redb` overrides the location.
 - **Feature Crates:** Each user-facing tool exposes its argument type and `run` entrypoint while retaining a standalone binary.
