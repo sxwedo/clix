@@ -181,6 +181,7 @@ mod tests {
             vec!["clix", "agent", "inspect", "codex:42"],
             vec!["clix", "agent", "logs", "session-id", "-n", "20"],
             vec!["clix", "agent", "sessions"],
+            vec!["clix", "agent", "sessions", "--plain"],
             vec![
                 "clix",
                 "agent",

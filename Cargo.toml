@@ -46,6 +46,8 @@ wiremock = "0.6.5"
 html2md = "0.2"
 scraper = "0.22"
 regex = "1.11"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 unicode-width = "0.2"
 

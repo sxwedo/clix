@@ -1,10 +1,11 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OpenFlags, params};
 use serde_json::Value;
 
 use crate::AgentKind;
@@ -17,12 +18,20 @@ const MAX_RECORD_BYTES: usize = 8 * 1_024 * 1_024;
 pub struct AgentSession {
     pub kind: AgentKind,
     pub id: String,
+    pub title: Option<String>,
     pub project: Option<PathBuf>,
     pub path: PathBuf,
     pub started_at: Option<String>,
     pub updated_at: u64,
     pub tokens: Option<u64>,
     pub cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeletionSummary {
+    pub files: usize,
+    pub directories: usize,
+    pub index_records: usize,
 }
 
 #[derive(Debug, Default)]
@@ -170,14 +179,91 @@ impl SessionCatalog {
         enriched.cost_usd = cost_usd;
         Ok(enriched)
     }
+
+    pub fn delete_session(&self, selected: &AgentSession) -> Result<DeletionSummary> {
+        if !self.sessions.iter().any(|session| {
+            session.kind == selected.kind
+                && session.id == selected.id
+                && session.path == selected.path
+        }) {
+            bail!("refusing to delete a session that is not in the current catalog");
+        }
+        validate_storage_identifier(&selected.id, "session ID")?;
+
+        let mut files: BTreeSet<PathBuf> = self
+            .sessions
+            .iter()
+            .filter(|session| session.kind == selected.kind && session.id == selected.id)
+            .map(|session| session.path.clone())
+            .collect();
+        let mut directories = BTreeSet::new();
+        collect_provider_artifacts(&self.home, selected, &mut files, &mut directories)?;
+        validate_deletion_targets(&self.home, &selected.kind, &files, &directories)?;
+
+        let index_records = delete_provider_index_records(&self.home, selected)?;
+        let mut summary = DeletionSummary {
+            index_records,
+            ..DeletionSummary::default()
+        };
+        for file in files {
+            remove_file_if_present(&file, &mut summary)?;
+        }
+        let mut directories: Vec<_> = directories.into_iter().collect();
+        directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+        for directory in directories {
+            remove_tree_if_present(&directory, &mut summary)?;
+        }
+        Ok(summary)
+    }
+}
+
+fn load_codex_titles(home: &Path) -> BTreeMap<String, String> {
+    let mut titles = BTreeMap::new();
+    let Ok(entries) = fs::read_dir(home.join(".codex")) else {
+        return titles;
+    };
+    let mut databases: Vec<_> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("state_") && name.ends_with(".sqlite"))
+        })
+        .collect();
+    databases.sort();
+    for database in databases {
+        let Ok(connection) = Connection::open_with_flags(
+            database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            continue;
+        };
+        let Ok(mut statement) = connection.prepare("SELECT id, title FROM threads") else {
+            continue;
+        };
+        let Ok(rows) = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            continue;
+        };
+        for row in rows.flatten() {
+            if let Some(title) = normalize_preview(&row.1) {
+                titles.insert(row.0, title);
+            }
+        }
+    }
+    titles
 }
 
 fn scan_codex(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
+    let indexed_titles = load_codex_titles(home);
     for path in files_with_extension(&home.join(".codex/sessions"), "jsonl")? {
         let mut id = None;
+        let mut title = None;
         let mut project = None;
         let mut started_at = None;
-        visit_bounded_lines_limit(&path, Some(1), |line| {
+        visit_bounded_lines_limit(&path, Some(128), |line| {
             let Ok(record) = serde_json::from_slice::<Value>(line) else {
                 return;
             };
@@ -187,11 +273,19 @@ fn scan_codex(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
                 started_at = string_at(&record, "/payload/timestamp")
                     .or_else(|| string_at(&record, "/timestamp"));
             }
+            if title.is_none()
+                && record.pointer("/payload/type").and_then(Value::as_str) == Some("message")
+                && record.pointer("/payload/role").and_then(Value::as_str) == Some("user")
+            {
+                title = record.pointer("/payload/content").and_then(content_preview);
+            }
         })?;
         if let Some(id) = id {
+            let title = indexed_titles.get(&id).cloned().or(title);
             sessions.push(session(
                 AgentKind::Codex,
                 id,
+                title,
                 project,
                 path,
                 started_at,
@@ -206,6 +300,7 @@ fn scan_codex(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
 fn scan_claude(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
     for path in files_with_extension(&home.join(".claude/projects"), "jsonl")? {
         let mut id = None;
+        let mut title = None;
         let mut project = None;
         let mut started_at = None;
         visit_bounded_lines_limit(&path, Some(64), |line| {
@@ -219,11 +314,18 @@ fn scan_claude(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
             started_at = started_at
                 .take()
                 .or_else(|| string_at(&record, "/timestamp"));
+            if title.is_none()
+                && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
+                && record.get("isMeta").and_then(Value::as_bool) != Some(true)
+            {
+                title = record.pointer("/message/content").and_then(content_preview);
+            }
         })?;
         if let Some(id) = id.or_else(|| file_stem(&path)) {
             sessions.push(session(
                 AgentKind::ClaudeCode,
                 id,
+                title,
                 project,
                 path,
                 started_at,
@@ -261,6 +363,16 @@ fn scan_gemini(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
         sessions.push(session(
             AgentKind::GeminiCli,
             id,
+            value
+                .get("messages")
+                .and_then(Value::as_array)
+                .and_then(|messages| {
+                    messages.iter().find_map(|message| {
+                        (message.get("type").and_then(Value::as_str) == Some("user"))
+                            .then(|| message.get("content").and_then(content_preview))
+                            .flatten()
+                    })
+                }),
             project,
             path,
             string_at(&value, "/startTime"),
@@ -283,6 +395,7 @@ fn scan_opencode(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
         sessions.push(session(
             AgentKind::OpenCode,
             id,
+            string_at(&value, "/title").and_then(|title| normalize_preview(&title)),
             string_at(&value, "/directory").map(PathBuf::from),
             path,
             value
@@ -311,6 +424,7 @@ fn scan_oh_my_pi(home: &Path, sessions: &mut Vec<AgentSession>) -> Result<()> {
 fn scan_pi_sessions(root: &Path, kind: &AgentKind, sessions: &mut Vec<AgentSession>) -> Result<()> {
     for path in files_with_extension(root, "jsonl")? {
         let mut id = None;
+        let mut title = None;
         let mut project = None;
         let mut started_at = None;
         visit_bounded_lines_limit(&path, Some(64), |line| {
@@ -322,11 +436,20 @@ fn scan_pi_sessions(root: &Path, kind: &AgentKind, sessions: &mut Vec<AgentSessi
                 project = string_at(&record, "/cwd").map(PathBuf::from);
                 started_at = string_at(&record, "/timestamp");
             }
+            if title.is_none() && record.get("type").and_then(Value::as_str) == Some("title") {
+                title = string_at(&record, "/title").and_then(|title| normalize_preview(&title));
+            }
+            if title.is_none()
+                && record.pointer("/message/role").and_then(Value::as_str) == Some("user")
+            {
+                title = record.pointer("/message/content").and_then(content_preview);
+            }
         })?;
         if let Some(id) = id {
             sessions.push(session(
                 kind.clone(),
                 id,
+                title,
                 project,
                 path,
                 started_at,
@@ -338,6 +461,483 @@ fn scan_pi_sessions(root: &Path, kind: &AgentKind, sessions: &mut Vec<AgentSessi
     Ok(())
 }
 
+fn collect_provider_artifacts(
+    home: &Path,
+    session: &AgentSession,
+    files: &mut BTreeSet<PathBuf>,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    match session.kind {
+        AgentKind::Codex => {
+            collect_files_with_prefix(
+                &home.join(".codex/shell_snapshots"),
+                &format!("{}.", session.id),
+                files,
+            )?;
+        }
+        AgentKind::ClaudeCode => {
+            if let Some(parent) = session.path.parent() {
+                directories.insert(parent.join(&session.id));
+            }
+            for root in ["session-env", "file-history"] {
+                directories.insert(home.join(".claude").join(root).join(&session.id));
+            }
+            collect_claude_team_artifacts(home, session, files, directories)?;
+            collect_matching_json_files(
+                &home.join(".claude/sessions"),
+                "/sessionId",
+                &session.id,
+                files,
+            )?;
+            collect_matching_json_files(
+                &home.join(".claude/plugins/claude-hud/transcript-cache"),
+                "/transcriptPath",
+                &session.path.to_string_lossy(),
+                files,
+            )?;
+        }
+        AgentKind::OpenCode => {
+            let storage = home.join(".local/share/opencode/storage");
+            let message_directory = storage.join("message").join(&session.id);
+            if message_directory.exists() {
+                for entry in fs::read_dir(&message_directory).with_context(|| {
+                    format!(
+                        "failed to inspect OpenCode messages in {}",
+                        message_directory.display()
+                    )
+                })? {
+                    let entry = entry.with_context(|| {
+                        format!(
+                            "failed to inspect an OpenCode message in {}",
+                            message_directory.display()
+                        )
+                    })?;
+                    if entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                        && let Some(message_id) = file_stem(&entry.path())
+                    {
+                        validate_storage_identifier(&message_id, "OpenCode message ID")?;
+                        directories.insert(storage.join("part").join(message_id));
+                    }
+                }
+            }
+            directories.insert(message_directory);
+            files.insert(
+                storage
+                    .join("session_diff")
+                    .join(format!("{}.json", session.id)),
+            );
+            files.insert(storage.join("todo").join(format!("{}.json", session.id)));
+        }
+        AgentKind::GeminiCli | AgentKind::Pi | AgentKind::OhMyPi => {}
+        AgentKind::Cursor | AgentKind::Custom(_) => {
+            bail!("{} sessions do not support local deletion", session.kind)
+        }
+    }
+    Ok(())
+}
+
+fn collect_claude_team_artifacts(
+    home: &Path,
+    session: &AgentSession,
+    files: &mut BTreeSet<PathBuf>,
+    directories: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let prefix: String = session.id.chars().take(8).collect();
+    let team = home.join(".claude/teams").join(format!("session-{prefix}"));
+    let config = team.join("config.json");
+    let matches_session = config.exists()
+        && read_json_file(&config)?.is_some_and(|value| {
+            value.pointer("/leadSessionId").and_then(Value::as_str) == Some(session.id.as_str())
+        });
+    if !matches_session {
+        return Ok(());
+    }
+
+    let tasks = home.join(".claude/tasks").join(format!("session-{prefix}"));
+    if tasks.exists() {
+        for entry in fs::read_dir(&tasks).with_context(|| {
+            format!(
+                "failed to inspect Claude task artifacts in {}",
+                tasks.display()
+            )
+        })? {
+            let path = entry
+                .with_context(|| format!("failed to inspect a Claude task in {}", tasks.display()))?
+                .path();
+            if let Some(agent_id) = file_stem(&path) {
+                validate_storage_identifier(&agent_id, "Claude task agent ID")?;
+                files.insert(home.join(".claude/debug").join(format!("{agent_id}.txt")));
+            }
+        }
+    }
+    directories.insert(tasks);
+    directories.insert(team);
+    Ok(())
+}
+
+fn collect_matching_json_files(
+    root: &Path,
+    pointer: &str,
+    expected: &str,
+    files: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for path in files_with_extension(root, "json")? {
+        if read_json_file(&path)?
+            .is_some_and(|value| value.pointer(pointer).and_then(Value::as_str) == Some(expected))
+        {
+            files.insert(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_files_with_prefix(
+    root: &Path,
+    prefix: &str,
+    files: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)
+        .with_context(|| format!("failed to inspect session artifacts in {}", root.display()))?
+    {
+        let entry = entry.with_context(|| {
+            format!("failed to inspect a session artifact in {}", root.display())
+        })?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(prefix))
+        {
+            files.insert(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn validate_deletion_targets(
+    home: &Path,
+    kind: &AgentKind,
+    files: &BTreeSet<PathBuf>,
+    directories: &BTreeSet<PathBuf>,
+) -> Result<()> {
+    let roots = match kind {
+        AgentKind::Codex => vec![
+            home.join(".codex/sessions"),
+            home.join(".codex/shell_snapshots"),
+        ],
+        AgentKind::ClaudeCode => vec![home.join(".claude")],
+        AgentKind::GeminiCli => vec![home.join(".gemini/tmp")],
+        AgentKind::OpenCode => vec![home.join(".local/share/opencode/storage")],
+        AgentKind::Pi => vec![home.join(".pi/agent/sessions")],
+        AgentKind::OhMyPi => vec![home.join(".omp/agent/sessions")],
+        AgentKind::Cursor | AgentKind::Custom(_) => Vec::new(),
+    };
+    for target in files.iter().chain(directories) {
+        let Some(root) = roots.iter().find(|root| target.starts_with(root)) else {
+            bail!(
+                "refusing to delete session artifact outside its provider store: {}",
+                target.display()
+            );
+        };
+        let metadata = match fs::symlink_metadata(target) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect session artifact {}", target.display())
+                });
+            }
+        };
+        let canonical_root = fs::canonicalize(root)
+            .with_context(|| format!("failed to resolve provider store root {}", root.display()))?;
+        let resolved = if metadata.file_type().is_symlink() {
+            fs::canonicalize(target.parent().unwrap_or(root))
+        } else {
+            fs::canonicalize(target)
+        }
+        .with_context(|| format!("failed to resolve session artifact {}", target.display()))?;
+        if !resolved.starts_with(&canonical_root) {
+            bail!(
+                "refusing to delete session artifact through a path outside its provider store: {}",
+                target.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_storage_identifier(value: &str, label: &str) -> Result<()> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("refusing to use unsafe {label} in a deletion path: {value:?}");
+    }
+    Ok(())
+}
+
+fn remove_file_if_present(path: &Path, summary: &mut DeletionSummary) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect session artifact {}", path.display()));
+        }
+    };
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return remove_tree_if_present(path, summary);
+    }
+    fs::remove_file(path)
+        .with_context(|| format!("failed to permanently delete {}", path.display()))?;
+    summary.files += 1;
+    Ok(())
+}
+
+fn remove_tree_if_present(path: &Path, summary: &mut DeletionSummary) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect session artifact {}", path.display()));
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return remove_file_if_present(path, summary);
+    }
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to inspect session directory {}", path.display()))?
+    {
+        let child = entry
+            .with_context(|| format!("failed to inspect a session artifact in {}", path.display()))?
+            .path();
+        let child_metadata = fs::symlink_metadata(&child)
+            .with_context(|| format!("failed to inspect session artifact {}", child.display()))?;
+        if child_metadata.is_dir() && !child_metadata.file_type().is_symlink() {
+            remove_tree_if_present(&child, summary)?;
+        } else {
+            remove_file_if_present(&child, summary)?;
+        }
+    }
+    fs::remove_dir(path)
+        .with_context(|| format!("failed to permanently delete {}", path.display()))?;
+    summary.directories += 1;
+    Ok(())
+}
+
+fn delete_provider_index_records(home: &Path, session: &AgentSession) -> Result<usize> {
+    match session.kind {
+        AgentKind::Codex => Ok(delete_codex_database_rows(home, &session.id)?
+            + remove_jsonl_records(&home.join(".codex/session_index.jsonl"), "/id", &session.id)?),
+        AgentKind::ClaudeCode => remove_jsonl_records(
+            &home.join(".claude/history.jsonl"),
+            "/sessionId",
+            &session.id,
+        ),
+        AgentKind::GeminiCli
+        | AgentKind::OpenCode
+        | AgentKind::Pi
+        | AgentKind::OhMyPi
+        | AgentKind::Cursor
+        | AgentKind::Custom(_) => Ok(0),
+    }
+}
+
+fn remove_jsonl_records(path: &Path, pointer: &str, expected: &str) -> Result<usize> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect session index {}", path.display()));
+        }
+    };
+    if metadata.len() > MAX_JSON_BYTES {
+        bail!(
+            "refusing to rewrite oversized session index {} ({} bytes)",
+            path.display(),
+            metadata.len()
+        );
+    }
+    let input = fs::read(path)
+        .with_context(|| format!("failed to read session index {}", path.display()))?;
+    let mut output = Vec::with_capacity(input.len());
+    let mut removed = 0_usize;
+    for line in input.split_inclusive(|byte| *byte == b'\n') {
+        let record = line.strip_suffix(b"\n").unwrap_or(line);
+        let record = record.strip_suffix(b"\r").unwrap_or(record);
+        let matches = serde_json::from_slice::<Value>(record)
+            .is_ok_and(|value| value.pointer(pointer).and_then(Value::as_str) == Some(expected));
+        if matches {
+            removed += 1;
+        } else {
+            output.extend_from_slice(line);
+        }
+    }
+    if removed > 0 {
+        clix_core::fs::atomic_write(path, &output)
+            .with_context(|| format!("failed to update session index {}", path.display()))?;
+    }
+    Ok(removed)
+}
+
+fn delete_codex_database_rows(home: &Path, session_id: &str) -> Result<usize> {
+    let codex_root = home.join(".codex");
+    if !codex_root.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0_usize;
+    for entry in fs::read_dir(&codex_root)
+        .with_context(|| format!("failed to inspect Codex state in {}", codex_root.display()))?
+    {
+        let database = entry
+            .with_context(|| format!("failed to inspect Codex state in {}", codex_root.display()))?
+            .path();
+        let Some(name) = database.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".sqlite")
+            || !["state_", "goals_", "logs_", "memories_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
+            continue;
+        }
+        let mut connection = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to open Codex state database {}", database.display()))?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(2))
+            .with_context(|| {
+                format!(
+                    "failed to configure Codex state database {}",
+                    database.display()
+                )
+            })?;
+        let transaction = connection.transaction().with_context(|| {
+            format!(
+                "failed to update Codex state database {}",
+                database.display()
+            )
+        })?;
+        for (table, statement) in codex_delete_statements(name) {
+            if sqlite_table_exists(&transaction, table)? {
+                removed += transaction
+                    .execute(statement, params![session_id])
+                    .with_context(|| {
+                        format!(
+                            "failed to delete session metadata from {table} in {}",
+                            database.display()
+                        )
+                    })?;
+            }
+        }
+        transaction.commit().with_context(|| {
+            format!(
+                "failed to commit Codex state cleanup in {}",
+                database.display()
+            )
+        })?;
+    }
+    Ok(removed)
+}
+
+fn codex_delete_statements(database_name: &str) -> &'static [(&'static str, &'static str)] {
+    if database_name.starts_with("state_") {
+        &[
+            (
+                "thread_dynamic_tools",
+                "DELETE FROM thread_dynamic_tools WHERE thread_id = ?1",
+            ),
+            (
+                "thread_spawn_edges",
+                "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+            ),
+            ("threads", "DELETE FROM threads WHERE id = ?1"),
+        ]
+    } else if database_name.starts_with("goals_") {
+        &[
+            (
+                "thread_goal_continuation_deferrals",
+                "DELETE FROM thread_goal_continuation_deferrals WHERE thread_id = ?1",
+            ),
+            (
+                "thread_goals",
+                "DELETE FROM thread_goals WHERE thread_id = ?1",
+            ),
+        ]
+    } else if database_name.starts_with("logs_") {
+        &[("logs", "DELETE FROM logs WHERE thread_id = ?1")]
+    } else if database_name.starts_with("memories_") {
+        &[
+            (
+                "stage1_outputs",
+                "DELETE FROM stage1_outputs WHERE thread_id = ?1",
+            ),
+            ("jobs", "DELETE FROM jobs WHERE job_key = ?1"),
+        ]
+    } else {
+        &[]
+    }
+}
+
+fn sqlite_table_exists(transaction: &rusqlite::Transaction<'_>, table: &str) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![table],
+            |row| row.get(0),
+        )
+        .context("failed to inspect a Codex state database schema")
+}
+
+fn content_preview(value: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    collect_content_text(value, &mut parts);
+    normalize_preview(&parts.join(" "))
+}
+
+fn collect_content_text(value: &Value, parts: &mut Vec<String>) {
+    match value {
+        Value::String(text) => parts.push(text.clone()),
+        Value::Array(values) => {
+            for value in values {
+                collect_content_text(value, parts);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(text) = object.get("text").or_else(|| object.get("content")) {
+                collect_content_text(text, parts);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn normalize_preview(value: &str) -> Option<String> {
+    const MAX_CHARS: usize = 120;
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    let mut chars = normalized.chars();
+    let preview: String = chars.by_ref().take(MAX_CHARS).collect();
+    Some(if chars.next().is_some() {
+        format!(
+            "{}…",
+            preview.chars().take(MAX_CHARS - 1).collect::<String>()
+        )
+    } else {
+        preview
+    })
+}
+
 fn is_root(path: &Path) -> bool {
     path.parent().is_none()
 }
@@ -346,6 +946,7 @@ fn is_root(path: &Path) -> bool {
 fn session(
     kind: AgentKind,
     id: String,
+    title: Option<String>,
     project: Option<PathBuf>,
     path: PathBuf,
     started_at: Option<String>,
@@ -355,6 +956,7 @@ fn session(
     Ok(AgentSession {
         kind,
         id,
+        title,
         project,
         updated_at: modified_seconds(&path)?,
         path,
@@ -626,6 +1228,8 @@ fn trim_carriage_return(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
 
@@ -642,6 +1246,7 @@ mod tests {
             &codex,
             concat!(
                 "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-id\",\"cwd\":\"/work/codex\",\"timestamp\":\"2026-01-02T03:04:05Z\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"Fix Codex rendering\"}]}}\n",
                 "{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"total_tokens\":120}}}}\n"
             ),
         );
@@ -651,6 +1256,7 @@ mod tests {
             &claude,
             concat!(
                 "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"timestamp\":\"2026-01-02T03:04:05Z\"}\n",
+                "{\"type\":\"user\",\"sessionId\":\"claude-id\",\"cwd\":\"/work/claude\",\"message\":{\"role\":\"user\",\"content\":\"Fix Claude rendering\"}}\n",
                 "{\"type\":\"assistant\",\"sessionId\":\"claude-id\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":20,\"cache_read_input_tokens\":30,\"cache_creation_input_tokens\":40}}}\n"
             ),
         );
@@ -659,12 +1265,12 @@ mod tests {
         write(&gemini_root.join(".project_root"), "/work/gemini\n");
         write(
             &gemini_root.join("chats/session.json"),
-            r#"{"sessionId":"gemini-id","startTime":"2026-01-02T03:04:05Z","lastUpdated":"2026-01-02T03:05:05Z","messages":[{"type":"gemini","tokens":{"total":55}}]}"#,
+            r#"{"sessionId":"gemini-id","startTime":"2026-01-02T03:04:05Z","lastUpdated":"2026-01-02T03:05:05Z","messages":[{"type":"user","content":"Fix Gemini rendering"},{"type":"gemini","tokens":{"total":55}}]}"#,
         );
 
         write(
             &home.join(".local/share/opencode/storage/session/project/opencode.json"),
-            r#"{"id":"opencode-id","directory":"/work/opencode","time":{"created":1760000000000,"updated":1760000001000}}"#,
+            r#"{"id":"opencode-id","directory":"/work/opencode","title":"Fix OpenCode rendering","time":{"created":1760000000000,"updated":1760000001000}}"#,
         );
         write(
             &home.join(".local/share/opencode/storage/message/opencode-id/message.json"),
@@ -675,6 +1281,7 @@ mod tests {
             &home.join(".pi/agent/sessions/project/pi.jsonl"),
             concat!(
                 "{\"type\":\"session\",\"id\":\"pi-id\",\"cwd\":\"/work/pi\",\"timestamp\":\"2026-01-02T03:04:05Z\"}\n",
+                "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"Fix Pi rendering\"}}\n",
                 "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":77,\"cost\":{\"total\":0.5}}}}\n"
             ),
         );
@@ -682,7 +1289,7 @@ mod tests {
         write(
             &home.join(".omp/agent/sessions/project/omp.jsonl"),
             concat!(
-                "{\"type\":\"title\",\"title\":\"Fixture\"}\n",
+                "{\"type\":\"title\",\"title\":\"Fix OMP rendering\"}\n",
                 "{\"type\":\"session\",\"id\":\"omp-id\",\"cwd\":\"/work/omp\",\"timestamp\":\"2026-01-02T03:04:05Z\"}\n",
                 "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"usage\":{\"totalTokens\":88,\"cost\":{\"total\":0.75}}}}\n"
             ),
@@ -690,18 +1297,286 @@ mod tests {
 
         let catalog = SessionCatalog::scan(home).expect("scan sessions");
         assert_eq!(catalog.sessions().len(), 6);
-        assert_session(&catalog, &AgentKind::Codex, "codex-id", 120, None);
-        assert_session(&catalog, &AgentKind::ClaudeCode, "claude-id", 100, None);
-        assert_session(&catalog, &AgentKind::GeminiCli, "gemini-id", 55, None);
+        assert_session(
+            &catalog,
+            &AgentKind::Codex,
+            "codex-id",
+            "Fix Codex rendering",
+            120,
+            None,
+        );
+        assert_session(
+            &catalog,
+            &AgentKind::ClaudeCode,
+            "claude-id",
+            "Fix Claude rendering",
+            100,
+            None,
+        );
+        assert_session(
+            &catalog,
+            &AgentKind::GeminiCli,
+            "gemini-id",
+            "Fix Gemini rendering",
+            55,
+            None,
+        );
         assert_session(
             &catalog,
             &AgentKind::OpenCode,
             "opencode-id",
+            "Fix OpenCode rendering",
             65,
             Some(0.25),
         );
-        assert_session(&catalog, &AgentKind::Pi, "pi-id", 77, Some(0.5));
-        assert_session(&catalog, &AgentKind::OhMyPi, "omp-id", 88, Some(0.75));
+        assert_session(
+            &catalog,
+            &AgentKind::Pi,
+            "pi-id",
+            "Fix Pi rendering",
+            77,
+            Some(0.5),
+        );
+        assert_session(
+            &catalog,
+            &AgentKind::OhMyPi,
+            "omp-id",
+            "Fix OMP rendering",
+            88,
+            Some(0.75),
+        );
+    }
+
+    #[test]
+    fn permanently_deletes_an_opencode_session_and_all_of_its_artifacts() {
+        let temp = tempdir().expect("temp home");
+        let home = temp.path();
+        let session_path =
+            home.join(".local/share/opencode/storage/session/project/opencode-delete.json");
+        write(
+            &session_path,
+            r#"{"id":"opencode-delete","directory":"/work/opencode","title":"Delete me","time":{"created":1760000000000,"updated":1760000001000}}"#,
+        );
+        write(
+            &home.join(".local/share/opencode/storage/message/opencode-delete/message-delete.json"),
+            r#"{"id":"message-delete","role":"assistant"}"#,
+        );
+        write(
+            &home.join(".local/share/opencode/storage/part/message-delete/part-delete.json"),
+            "{}",
+        );
+        write(
+            &home.join(".local/share/opencode/storage/session_diff/opencode-delete.json"),
+            "{}",
+        );
+        write(
+            &home.join(".local/share/opencode/storage/todo/opencode-delete.json"),
+            "{}",
+        );
+        let decoy = home.join(".local/share/opencode/storage/todo/keep.json");
+        write(&decoy, "{}");
+
+        let catalog = SessionCatalog::scan(home).expect("scan sessions");
+        let session = catalog
+            .resolve(Some("opencode"), "opencode-delete")
+            .expect("session to delete");
+        let result = catalog
+            .delete_session(session)
+            .expect("delete session artifacts");
+
+        assert!(result.files >= 4);
+        assert!(!session_path.exists());
+        assert!(
+            !home
+                .join(".local/share/opencode/storage/message/opencode-delete")
+                .exists()
+        );
+        assert!(
+            !home
+                .join(".local/share/opencode/storage/part/message-delete")
+                .exists()
+        );
+        assert!(decoy.exists(), "unrelated provider data must be preserved");
+    }
+
+    #[test]
+    fn deletion_rejects_session_ids_that_can_escape_a_provider_store() {
+        let temp = tempdir().expect("temp home");
+        let session_path = temp
+            .path()
+            .join(".local/share/opencode/storage/session/project/unsafe.json");
+        write(
+            &session_path,
+            r#"{"id":"../../outside","directory":"/work/opencode","title":"Unsafe"}"#,
+        );
+        let catalog = SessionCatalog::scan(temp.path()).expect("scan sessions");
+        let session = catalog.sessions().first().expect("unsafe fixture session");
+
+        let error = catalog
+            .delete_session(session)
+            .expect_err("unsafe session ID must be rejected");
+
+        assert!(format!("{error:#}").contains("unsafe session ID"));
+        assert!(session_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_rejects_nested_symlinks_that_escape_a_provider_store() {
+        let temp = tempdir().expect("temp home");
+        let home = temp.path();
+        let session_id = "claude-safe-id";
+        let session_path = home.join(format!(".claude/projects/project/{session_id}.jsonl"));
+        write(
+            &session_path,
+            &format!("{{\"sessionId\":\"{session_id}\",\"cwd\":\"/work\"}}\n"),
+        );
+        let outside = home.join("outside-file-history");
+        let escaped = outside.join(session_id).join("change.txt");
+        write(&escaped, "must survive");
+        symlink(&outside, home.join(".claude/file-history")).expect("create nested symlink");
+        let catalog = SessionCatalog::scan(home).expect("scan sessions");
+        let session = catalog
+            .resolve(Some("claude"), session_id)
+            .expect("fixture session");
+
+        let error = catalog
+            .delete_session(session)
+            .expect_err("escaped artifact must be rejected");
+
+        assert!(format!("{error:#}").contains("outside its provider store"));
+        assert!(session_path.exists());
+        assert!(escaped.exists());
+    }
+
+    #[test]
+    fn permanently_deletes_claude_session_history_team_and_runtime_artifacts() {
+        let temp = tempdir().expect("temp home");
+        let home = temp.path();
+        let session_id = "2672f407-038c-409d-8aa0-e8e7c39cf8d7";
+        let session_path = home.join(format!(".claude/projects/project/{session_id}.jsonl"));
+        write(
+            &session_path,
+            &format!(
+                "{{\"sessionId\":\"{session_id}\",\"cwd\":\"/work/claude\",\"message\":{{\"role\":\"user\",\"content\":\"Delete me\"}}}}\n"
+            ),
+        );
+        let history = home.join(".claude/history.jsonl");
+        write(
+            &history,
+            &format!(
+                "{{\"sessionId\":\"{session_id}\",\"display\":\"delete\"}}\n{{\"sessionId\":\"keep\",\"display\":\"keep\"}}\n"
+            ),
+        );
+        let runtime = home.join(".claude/sessions/1.json");
+        write(&runtime, &format!("{{\"sessionId\":\"{session_id}\"}}"));
+        let runtime_decoy = home.join(".claude/sessions/2.json");
+        write(&runtime_decoy, r#"{"sessionId":"keep"}"#);
+        let team = home.join(".claude/teams/session-2672f407");
+        write(
+            &team.join("config.json"),
+            &format!("{{\"leadSessionId\":\"{session_id}\"}}"),
+        );
+        let tasks = home.join(".claude/tasks/session-2672f407");
+        write(&tasks.join("agent-id.txt"), "task");
+        let debug = home.join(".claude/debug/agent-id.txt");
+        write(&debug, "debug");
+        let cache = home.join(".claude/plugins/claude-hud/transcript-cache/delete.json");
+        write(
+            &cache,
+            &serde_json::json!({"transcriptPath": session_path}).to_string(),
+        );
+        let cache_decoy = home.join(".claude/plugins/claude-hud/transcript-cache/keep.json");
+        write(&cache_decoy, r#"{"transcriptPath":"/tmp/keep.jsonl"}"#);
+        write(
+            &home.join(format!(".claude/file-history/{session_id}/change.txt")),
+            "history",
+        );
+
+        let catalog = SessionCatalog::scan(home).expect("scan sessions");
+        let session = catalog
+            .resolve(Some("claude"), session_id)
+            .expect("session to delete");
+        let result = catalog
+            .delete_session(session)
+            .expect("delete Claude session");
+
+        assert_eq!(result.index_records, 1);
+        assert!(!session_path.exists());
+        assert!(!runtime.exists());
+        assert!(!team.exists());
+        assert!(!tasks.exists());
+        assert!(!debug.exists());
+        assert!(!cache.exists());
+        assert!(runtime_decoy.exists());
+        assert!(cache_decoy.exists());
+        assert_eq!(
+            fs::read_to_string(history).expect("read rewritten history"),
+            "{\"sessionId\":\"keep\",\"display\":\"keep\"}\n"
+        );
+    }
+
+    #[test]
+    fn permanently_deletes_codex_session_indexes_and_shell_snapshots() {
+        let temp = tempdir().expect("temp home");
+        let home = temp.path();
+        let session_path = home.join(".codex/sessions/2026/01/02/delete.jsonl");
+        write(
+            &session_path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-delete\",\"cwd\":\"/work/codex\"}}\n",
+        );
+        let snapshot = home.join(".codex/shell_snapshots/codex-delete.1.sh");
+        write(&snapshot, "snapshot");
+        let decoy = home.join(".codex/shell_snapshots/codex-keep.1.sh");
+        write(&decoy, "snapshot");
+        let session_index = home.join(".codex/session_index.jsonl");
+        write(
+            &session_index,
+            concat!(
+                "{\"id\":\"codex-delete\",\"thread_name\":\"Delete me\"}\n",
+                "{\"id\":\"codex-keep\",\"thread_name\":\"Keep me\"}\n"
+            ),
+        );
+        let database_path = home.join(".codex/state_5.sqlite");
+        let connection = rusqlite::Connection::open(&database_path).expect("open fixture db");
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL);\
+                 CREATE TABLE thread_dynamic_tools (thread_id TEXT NOT NULL);\
+                 CREATE TABLE thread_spawn_edges (parent_thread_id TEXT, child_thread_id TEXT);\
+                 INSERT INTO threads VALUES ('codex-delete', 'Delete me');\
+                 INSERT INTO thread_dynamic_tools VALUES ('codex-delete');\
+                 INSERT INTO thread_spawn_edges VALUES ('codex-delete', 'child');",
+            )
+            .expect("seed fixture db");
+        drop(connection);
+
+        let catalog = SessionCatalog::scan(home).expect("scan sessions");
+        let session = catalog
+            .resolve(Some("codex"), "codex-delete")
+            .expect("session to delete");
+        assert_eq!(session.title.as_deref(), Some("Delete me"));
+        let result = catalog
+            .delete_session(session)
+            .expect("delete Codex session");
+
+        assert!(result.index_records >= 4);
+        assert!(!session_path.exists());
+        assert!(!snapshot.exists());
+        assert!(decoy.exists());
+        assert_eq!(
+            fs::read_to_string(session_index).expect("read rewritten session index"),
+            "{\"id\":\"codex-keep\",\"thread_name\":\"Keep me\"}\n"
+        );
+        let connection = rusqlite::Connection::open(database_path).expect("reopen fixture db");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'codex-delete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query fixture db");
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -744,6 +1619,7 @@ mod tests {
         catalog: &SessionCatalog,
         kind: &AgentKind,
         id: &str,
+        title: &str,
         tokens: u64,
         cost_usd: Option<f64>,
     ) {
@@ -754,6 +1630,7 @@ mod tests {
             .expect("session kind");
         let session = catalog.with_usage(session).expect("load session usage");
         assert_eq!(session.id, id);
+        assert_eq!(session.title.as_deref(), Some(title));
         assert_eq!(session.tokens, Some(tokens));
         assert_eq!(session.cost_usd, cost_usd);
     }

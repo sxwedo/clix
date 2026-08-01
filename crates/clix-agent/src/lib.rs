@@ -3,6 +3,7 @@
 mod controller;
 mod process;
 mod session;
+mod tui;
 mod view;
 
 use anyhow::Result;
@@ -85,6 +86,9 @@ pub struct SessionsArgs {
     /// Emit stable machine-readable JSON
     #[arg(long)]
     pub json: bool,
+    /// Print a non-interactive table even when attached to a terminal
+    #[arg(long, conflicts_with = "json")]
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -124,7 +128,7 @@ pub fn run(args: AgentArgs, settings: &Settings) -> Result<()> {
         AgentCommand::Top(args) => controller::run_top(&args, settings),
         AgentCommand::Inspect(args) => controller::run_inspect(&args, settings),
         AgentCommand::Logs(args) => controller::run_logs(&args, settings),
-        AgentCommand::Sessions(args) => controller::run_sessions(&args),
+        AgentCommand::Sessions(args) => controller::run_sessions(&args, settings),
         AgentCommand::Stop(args) => controller::run_stop(&args, settings),
         AgentCommand::Resume(args) => controller::run_resume(&args, settings),
     }
@@ -229,6 +233,7 @@ mod tests {
             session: Some(AgentSession {
                 kind: AgentKind::Codex,
                 id: "session-id".to_owned(),
+                title: Some("Fix rendering".to_owned()),
                 project: Some(PathBuf::from("/work/actual-project")),
                 path: PathBuf::from("/tmp/session.jsonl"),
                 started_at: None,

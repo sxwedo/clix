@@ -1,23 +1,19 @@
+use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clix_core::settings::{CustomAgentSettings, Settings};
-use crossterm::cursor::{Hide, MoveTo, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use serde_json::Value;
 
 use crate::process::{
     AgentKind, LiveAgent, discover_live_agents, discover_live_agents_with_cpu, stop_agent,
 };
 use crate::session::{AgentSession, SessionCatalog, UsageCache, tail_records};
+use crate::tui;
 use crate::view::{
     AgentReport, format_bytes, format_duration, render_process_table, render_session_table,
 };
@@ -44,7 +40,11 @@ pub fn run_top(args: &TopArgs, settings: &Settings) -> Result<()> {
         bail!("--iterations must be at least 1");
     }
     if args.iterations.is_none() && io::stdout().is_terminal() && io::stdin().is_terminal() {
-        return run_top_interactive(args, settings);
+        let mut usage_cache = UsageCache::default();
+        return tui::run_top(Duration::from_secs(args.interval), || {
+            let agents = discover_live_agents_with_cpu(&settings.agent.custom, true)?;
+            agent_reports(agents, &mut usage_cache)
+        });
     }
 
     let iterations = args.iterations.unwrap_or(1);
@@ -62,91 +62,6 @@ pub fn run_top(args: &TopArgs, settings: &Settings) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn run_top_interactive(args: &TopArgs, settings: &Settings) -> Result<()> {
-    let _terminal = TerminalGuard::enter()?;
-    let mut usage_cache = UsageCache::default();
-    let mut selected = 0_usize;
-    let mut show_details = false;
-
-    loop {
-        let agents = discover_live_agents_with_cpu(&settings.agent.custom, true)?;
-        let reports = agent_reports(agents, &mut usage_cache)?;
-        selected = selected.min(reports.len().saturating_sub(1));
-        draw_top(&reports, selected, show_details)?;
-
-        let deadline = Instant::now() + Duration::from_secs(args.interval);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero()
-                || !event::poll(remaining).context("failed to poll terminal input")?
-            {
-                break;
-            }
-            match event::read().context("failed to read terminal input")? {
-                Event::Key(key) if is_key_press(&key) => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if selected + 1 < reports.len() {
-                            selected += 1;
-                        }
-                    }
-                    KeyCode::Enter | KeyCode::Char('i') => show_details = !show_details,
-                    KeyCode::Char('r') => break,
-                    _ => continue,
-                },
-                Event::Resize(_, _) => {}
-                _ => continue,
-            }
-            draw_top(&reports, selected, show_details)?;
-        }
-    }
-}
-
-fn draw_top(reports: &[AgentReport], selected: usize, show_details: bool) -> Result<()> {
-    let mut stdout = io::stdout();
-    execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
-        .context("failed to clear interactive agent view")?;
-    writeln!(stdout, "clix agent top — {} running\n", reports.len())?;
-    write!(
-        stdout,
-        "{}",
-        render_process_table(reports, true, Some(selected))
-    )?;
-    if show_details && let Some(report) = reports.get(selected) {
-        writeln!(stdout)?;
-        writeln!(stdout, "Selected: {}", report_id(report))?;
-        writeln!(stdout, "Project:  {}", display_path(report.project()))?;
-        writeln!(
-            stdout,
-            "Session:  {}",
-            report.session.as_ref().map_or_else(
-                || "-".to_owned(),
-                |session| format!("{}:{}", session.kind.slug(), session.id)
-            )
-        )?;
-        writeln!(
-            stdout,
-            "Usage:    {} tokens, {}",
-            format_tokens(report.session.as_ref().and_then(|session| session.tokens)),
-            report.session.as_ref().map_or_else(
-                || "cost -".to_owned(),
-                |session| format!("cost {}", format_cost(session.cost_usd))
-            )
-        )?;
-    }
-    writeln!(
-        stdout,
-        "\n↑/↓ or j/k select  Enter/i details  r refresh  q quit"
-    )?;
-    stdout.flush().context("failed to refresh agent view")
 }
 
 pub fn run_inspect(args: &TargetArgs, settings: &Settings) -> Result<()> {
@@ -236,7 +151,7 @@ pub fn run_logs(args: &LogsArgs, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-pub fn run_sessions(args: &SessionsArgs) -> Result<()> {
+pub fn run_sessions(args: &SessionsArgs, settings: &Settings) -> Result<()> {
     if args.limit == Some(0) {
         bail!("--limit must be at least 1");
     }
@@ -263,6 +178,17 @@ pub fn run_sessions(args: &SessionsArgs) -> Result<()> {
     if args.json {
         let values: Vec<_> = sessions.iter().map(session_list_json).collect();
         println!("{}", serde_json::to_string_pretty(&values)?);
+    } else if !args.plain && io::stdin().is_terminal() && io::stdout().is_terminal() {
+        let active_targets = active_session_targets(&catalog, settings)?;
+        let selected = tui::manage_sessions(sessions.to_vec(), active_targets, |session| {
+            if active_session_targets(&catalog, settings)?.contains(&session_target(session)) {
+                bail!("cannot delete a session that is attached to a running agent");
+            }
+            catalog.delete_session(session)
+        })?;
+        if let Some(session) = selected {
+            resume_target(&session_target(&session), settings)?;
+        }
     } else {
         print!("{}", render_session_table(sessions, None));
     }
@@ -309,7 +235,15 @@ pub fn run_resume(args: &ResumeArgs, settings: &Settings) -> Result<()> {
         let selected = if args.last {
             sessions.first().cloned()
         } else {
-            pick_resume_session(sessions)?
+            if sessions.is_empty() {
+                bail!("no saved developer-agent sessions were found");
+            }
+            if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                bail!(
+                    "interactive session selection requires a terminal; use `clix agent resume --list`"
+                );
+            }
+            tui::pick_session(sessions.to_vec())?
         };
         let Some(session) = selected else {
             return Ok(());
@@ -340,47 +274,6 @@ fn resume_target(target: &str, settings: &Settings) -> Result<()> {
     };
     let spec = resume_spec(&kind, &id)?;
     execute_resume(&spec, &kind, &id, project)
-}
-
-fn pick_resume_session(sessions: &[AgentSession]) -> Result<Option<AgentSession>> {
-    if sessions.is_empty() {
-        bail!("no saved developer-agent sessions were found");
-    }
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("interactive session selection requires a terminal; use `clix agent resume --list`");
-    }
-
-    let _terminal = TerminalGuard::enter()?;
-    let mut selected = 0_usize;
-    loop {
-        let mut stdout = io::stdout();
-        execute!(stdout, MoveTo(0, 0), Clear(ClearType::All))
-            .context("failed to clear session picker")?;
-        writeln!(stdout, "Select a session to resume\n")?;
-        write!(stdout, "{}", render_session_table(sessions, Some(selected)))?;
-        writeln!(stdout, "\n↑/↓ or j/k select  Enter resume  q cancel")?;
-        stdout.flush().context("failed to refresh session picker")?;
-
-        if let Event::Key(key) = event::read().context("failed to read terminal input")? {
-            if !is_key_press(&key) {
-                continue;
-            }
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(None);
-                }
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if selected + 1 < sessions.len() {
-                        selected += 1;
-                    }
-                }
-                KeyCode::Enter => return Ok(sessions.get(selected).cloned()),
-                _ => {}
-            }
-        }
-    }
 }
 
 fn execute_resume(
@@ -482,6 +375,29 @@ fn agent_reports(agents: Vec<LiveAgent>, usage_cache: &mut UsageCache) -> Result
         .collect()
 }
 
+fn active_session_targets(
+    catalog: &SessionCatalog,
+    settings: &Settings,
+) -> Result<BTreeSet<String>> {
+    let live = discover_live_agents(&settings.agent.custom)?;
+    Ok(live
+        .iter()
+        .filter_map(|agent| {
+            catalog
+                .latest_for_process(
+                    &agent.kind,
+                    agent.process.cwd.as_deref(),
+                    agent.process.started_at,
+                )
+                .map(session_target)
+        })
+        .collect())
+}
+
+fn session_target(session: &AgentSession) -> String {
+    format!("{}:{}", session.kind.slug(), session.id)
+}
+
 fn resolve_live<'a>(
     agents: &'a [LiveAgent],
     target: &str,
@@ -555,6 +471,7 @@ fn session_json(session: &AgentSession) -> Value {
     serde_json::json!({
         "agent": session.kind.slug(),
         "session_id": session.id,
+        "title": session.title,
         "project": session.project,
         "log": session.path,
         "started_at": session.started_at,
@@ -569,6 +486,7 @@ fn session_list_json(session: &AgentSession) -> Value {
         "target": format!("{}:{}", session.kind.slug(), session.id),
         "agent": session.kind.slug(),
         "session_id": session.id,
+        "title": session.title,
         "project": session.project,
         "log": session.path,
         "started_at": session.started_at,
@@ -615,6 +533,7 @@ fn print_live_details(agent: &LiveAgent, session: Option<&AgentSession>) {
 fn print_session_details(session: &AgentSession) {
     println!("Session:     {}:{}", session.kind.slug(), session.id);
     println!("Agent:       {}", session.kind);
+    println!("Title:       {}", session.title.as_deref().unwrap_or("-"));
     println!("Project:     {}", display_path(session.project.as_deref()));
     println!(
         "Started:     {}",
@@ -723,10 +642,6 @@ fn display_path(path: Option<&Path>) -> String {
     path.map_or_else(|| "-".to_owned(), |path| path.display().to_string())
 }
 
-fn report_id(report: &AgentReport) -> String {
-    format!("{}:{}", report.agent.kind.slug(), report.agent.process.pid)
-}
-
 fn format_tokens(tokens: Option<u64>) -> String {
     tokens.map_or_else(|| "-".to_owned(), |tokens| tokens.to_string())
 }
@@ -740,30 +655,6 @@ fn format_unix_timestamp(timestamp: u64) -> String {
         .ok()
         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0))
         .map_or_else(|| timestamp.to_string(), |value| value.to_rfc3339())
-}
-
-const fn is_key_press(key: &KeyEvent) -> bool {
-    matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-}
-
-struct TerminalGuard;
-
-impl TerminalGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode().context("failed to enable terminal raw mode")?;
-        if let Err(error) = execute!(io::stdout(), EnterAlternateScreen, Hide) {
-            let _ = disable_raw_mode();
-            return Err(error).context("failed to enter the interactive terminal view");
-        }
-        Ok(Self)
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-    }
 }
 
 #[cfg(test)]

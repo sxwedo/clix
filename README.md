@@ -67,15 +67,17 @@ clix/
 clix agent ps
 clix agent ps --json
 
-# Interactive CPU/memory view: ↑/↓ or j/k select, Enter/i shows details,
-# r refreshes immediately, and q exits. Pipes/non-terminals render once.
+# Responsive CPU/memory TUI: ↑/↓ or j/k select, Enter/i shows a bounded
+# details panel, r refreshes immediately, and q exits. Pipes render once.
 clix agent top
 clix agent top --interval 3 --iterations 5
 
-# List every saved local session, including sessions with no running process.
-# TARGET values can be passed directly to inspect, logs, or resume.
+# Open the interactive session manager. It shows a title/summary and supports
+# / search, Enter/i details, r resume, and d followed by y permanent deletion.
 clix agent sessions
 clix agent sessions --provider claude --limit 20
+# Force the non-interactive table; non-terminals select this automatically.
+clix agent sessions --plain
 clix agent sessions --json
 
 # Inspect a live process or an archived session.
@@ -103,7 +105,9 @@ clix agent resume cursor:chat-id
 
 The process table exposes `ID`, `AGENT`, `PROJECT`, `STATUS`, `DURATION`, `TOKENS`, and `COST`; `top` adds CPU and memory. Status is derived from the operating system process state. clix associates a live process with its newest matching local session and uses the session project when a GUI host reports an unhelpful root working directory. A `-` means no session could be associated; `n/a` means a session was associated but the provider did not persist an exact cost. clix never estimates cost from public model prices.
 
-Session metadata and logs are read from each provider's native local store. `sessions` indexes lightweight metadata without requiring a live process, so closed Claude Code, Codex, Pi, and Oh My Pi sessions remain discoverable and resumable. Token/cost usage is calculated only for associated or explicitly inspected sessions, and the interactive view caches usage until a session file changes. `logs` bounds individual record size and its retained tail, while `--raw` deliberately exposes the original selected records.
+Session metadata and logs are read from each provider's native local store. `sessions` indexes lightweight metadata without requiring a live process, so closed Claude Code, Codex, Pi, and Oh My Pi sessions remain discoverable and resumable. Titles come from native provider metadata when available and otherwise fall back to the first user message. Permanent deletion removes every catalog path with the same provider/session ID plus known native sidecars and indexes; Claude history and Codex SQLite/JSONL index records are cleaned as well. The confirmation explicitly requires `y`, cannot be undone, and is refused for a session currently matched to a running agent.
+
+Token/cost usage is calculated only for associated or explicitly inspected sessions, and the interactive view caches usage until a session file changes. `logs` bounds individual record size and its retained tail, while `--raw` deliberately exposes the original selected records.
 
 Custom agents use exact executable names plus optional argv markers. The resume command is an argv array with a required `{session}` placeholder, so it never passes configuration through a shell:
 

@@ -96,7 +96,7 @@ pub fn render_session_table(sessions: &[AgentSession], selected: Option<usize>) 
         return "No saved developer-agent sessions found.\n".to_owned();
     }
 
-    let headers = ["TARGET", "AGENT", "PROJECT", "UPDATED"];
+    let headers = ["TARGET", "AGENT", "PROJECT", "TITLE / SUMMARY", "UPDATED"];
     let rows: Vec<Vec<String>> = sessions
         .iter()
         .enumerate()
@@ -108,6 +108,10 @@ pub fn render_session_table(sessions: &[AgentSession], selected: Option<usize>) 
                     .project
                     .as_deref()
                     .map_or_else(|| "-".to_owned(), project_label),
+                session
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "(untitled)".to_owned()),
                 format_age(session.updated_at),
             ];
             if let Some(selected) = selected {
@@ -124,7 +128,17 @@ pub fn render_session_table(sessions: &[AgentSession], selected: Option<usize>) 
         })
         .collect();
     if selected.is_some() {
-        render_table(&["", "TARGET", "AGENT", "PROJECT", "UPDATED"], &rows)
+        render_table(
+            &[
+                "",
+                "TARGET",
+                "AGENT",
+                "PROJECT",
+                "TITLE / SUMMARY",
+                "UPDATED",
+            ],
+            &rows,
+        )
     } else {
         render_table(&headers, &rows)
     }
