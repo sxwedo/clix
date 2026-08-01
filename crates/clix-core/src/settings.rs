@@ -37,14 +37,6 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"
 
-# Custom developer agents recognized by `clix agent`.
-# Matching is exact on the executable name; every `command_contains` marker
-# must also be present. Resume is argv, never a shell command.
-# [agent.custom.my_agent]
-# executables = [\"my-agent\"]
-# command_contains = [\"--agent-mode\"]
-# resume = [\"my-agent\", \"resume\", \"{session}\"]
-
 # [lark.accounts.default]
 # Lark custom app credentials.
 # app_id = \"cli_xxxxxxxxxxxxxxxx\"
@@ -93,8 +85,6 @@ const DEFAULT_CONFIG_TEMPLATE: &str = "\
 #[derive(Debug, Default, Deserialize)]
 pub struct Settings {
     #[serde(default)]
-    pub agent: AgentSettings,
-    #[serde(default)]
     pub github: GitHubSettings,
     #[serde(default)]
     pub x: XSettings,
@@ -102,28 +92,6 @@ pub struct Settings {
     pub lark: LarkSettings,
     #[serde(default)]
     pub rss: RssSettings,
-}
-
-/// `[agent]` section: locally recognized custom developer agents.
-#[derive(Debug, Default, Clone, Deserialize)]
-pub struct AgentSettings {
-    /// Named custom process recognizers and optional resume commands.
-    #[serde(default)]
-    pub custom: BTreeMap<String, CustomAgentSettings>,
-}
-
-/// One custom developer-agent process recognizer.
-#[derive(Debug, Clone, Deserialize)]
-pub struct CustomAgentSettings {
-    /// Exact executable basenames, for example `my-agent`.
-    #[serde(default)]
-    pub executables: Vec<String>,
-    /// Substrings that must all occur in the process argv.
-    #[serde(default)]
-    pub command_contains: Vec<String>,
-    /// Native argv used to resume; `{session}` is replaced without invoking a shell.
-    #[serde(default)]
-    pub resume: Vec<String>,
 }
 
 /// `[github]` section: explicit GitHub credentials.
@@ -323,7 +291,6 @@ mod tests {
         assert!(settings.github.username.is_none());
         assert!(settings.x.auth_token.is_none());
         assert!(settings.x.ct0.is_none());
-        assert!(settings.agent.custom.is_empty());
         assert!(settings.rss.state.is_none());
         assert!(settings.rss.limit.is_none());
         assert!(settings.rss.feeds.is_empty());
@@ -442,22 +409,5 @@ url = "原文链接"
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[rss]"));
         assert!(DEFAULT_CONFIG_TEMPLATE.contains("[[rss.feeds]]"));
         assert!(settings.rss.feeds.is_empty());
-    }
-
-    #[test]
-    fn custom_agent_matchers_and_resume_argv_parse_without_shell_strings() {
-        let settings: Settings = toml::from_str(
-            r#"
-[agent.custom.my_agent]
-executables = ["my-agent", "my-agent.exe"]
-command_contains = ["--agent-mode"]
-resume = ["my-agent", "resume", "{session}"]
-"#,
-        )
-        .expect("custom agent config");
-        let custom = &settings.agent.custom["my_agent"];
-        assert_eq!(custom.executables, ["my-agent", "my-agent.exe"]);
-        assert_eq!(custom.command_contains, ["--agent-mode"]);
-        assert_eq!(custom.resume, ["my-agent", "resume", "{session}"]);
     }
 }

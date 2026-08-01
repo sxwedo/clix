@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/clix-agent",
     "crates/clix-core",
     "crates/clix-gh-stars",
     "crates/clix-lark-base",
@@ -28,7 +27,6 @@ license = "MIT"
 anstyle = "1.0"
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-crossterm = "0.29"
 dirs = "5"
 clap = { version = "4.5", features = ["derive"] }
 feed-rs = { version = "2.4", features = ["sanitize"] }
@@ -46,25 +44,20 @@ wiremock = "0.6.5"
 html2md = "0.2"
 scraper = "0.22"
 regex = "1.11"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
-rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
-sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
-unicode-width = "0.2"
 
 [package]
 name = "clix"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "A fast, local-first control plane for developer agents."
+description = "A fast, local-first toolkit for feeds, developer platforms, and content."
 license.workspace = true
 readme = "README.md"
-keywords = ["cli", "developer-tools", "agents", "automation", "local-first"]
+keywords = ["cli", "developer-tools", "feeds", "automation", "local-first"]
 
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-clix-agent = { path = "crates/clix-agent" }
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
 clix-rss-list = { path = "crates/clix-rss-list" }

@@ -2,7 +2,6 @@ use std::future::Future;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use clix_agent::AgentArgs;
 use clix_core::ui;
 use clix_gh_stars::StarsArgs;
 use clix_rss_list::ListArgs;
@@ -15,8 +14,8 @@ use clix_x_read::ReadArgs;
     name = "clix",
     author,
     version,
-    about = "A fast, local-first control plane for developer agents.",
-    long_about = "clix discovers, inspects, and controls local developer agents while retaining focused RSS, GitHub, social, and content utilities."
+    about = "A fast, local-first toolkit for feeds, developer platforms, and content.",
+    long_about = "clix provides durable RSS sync, GitHub exports, social-media preservation, and focused local content utilities."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -25,8 +24,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Monitor and control local developer-agent processes and sessions
-    Agent(AgentArgs),
     /// GitHub developer tools & utilities
     Gh {
         #[command(subcommand)]
@@ -94,10 +91,6 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Commands::Agent(args) => {
-            let settings = clix_core::settings::Settings::load()?;
-            clix_agent::run(args, &settings)
-        }
         Commands::Config { command } => run_config(command),
         Commands::Gh { command } => {
             let settings = clix_core::settings::Settings::load()?;
@@ -163,44 +156,6 @@ mod tests {
     #[test]
     fn command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
-    }
-
-    #[test]
-    fn parses_agent_process_and_session_commands() {
-        for invocation in [
-            vec!["clix", "agent", "ps", "--json"],
-            vec![
-                "clix",
-                "agent",
-                "top",
-                "--interval",
-                "3",
-                "--iterations",
-                "1",
-            ],
-            vec!["clix", "agent", "inspect", "codex:42"],
-            vec!["clix", "agent", "logs", "session-id", "-n", "20"],
-            vec!["clix", "agent", "sessions"],
-            vec!["clix", "agent", "sessions", "--plain"],
-            vec![
-                "clix",
-                "agent",
-                "sessions",
-                "--provider",
-                "claude",
-                "--limit",
-                "10",
-                "--json",
-            ],
-            vec!["clix", "agent", "stop", "claude:42"],
-            vec!["clix", "agent", "resume"],
-            vec!["clix", "agent", "resume", "--list"],
-            vec!["clix", "agent", "resume", "gemini:session-id"],
-        ] {
-            let cli = Cli::try_parse_from(&invocation)
-                .unwrap_or_else(|error| panic!("failed to parse {invocation:?}: {error}"));
-            assert!(matches!(cli.command, Commands::Agent(_)));
-        }
     }
 
     #[test]
