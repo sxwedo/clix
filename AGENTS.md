@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 
 ## Overview
 
-`clix` is a fast, local-first control plane for developer agents, with focused RSS, GitHub, social media, and content utilities.
+`clix` is a fast, local-first toolkit for RSS, GitHub, social media, and content utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix agent ps`, `clix agent inspect`, `clix gh stars`, `clix rss sync`, `clix rss list`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss sync`, `clix rss list`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
 - **Zero-Config GitHub Auth**: Falls back through the config file, `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`; usernames come from the config file, the authenticated `gh` account, or `github.user`.
 - **Externalized Configuration**: Credentials and RSS subscriptions live in `~/.config/clix/config.toml` (`clix config init` generates a 0600 template). Credential resolution priority: CLI flags > config file > environment variables > GitHub autodetect.
 
@@ -38,7 +38,6 @@ clix/
   ├── Cargo.toml              # Root workspace manifest and shared dependencies
   ├── .mise.toml              # Verification and build tasks
   ├── crates/
-  │   ├── clix-agent/         # Local agent process/session discovery, inspection, and control
   │   ├── clix-core/          # Shared UI, filesystem, config loading (settings.rs), and GitHub auth helpers
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-lark-base/     # Shared authenticated Lark Base schema and upsert interface
@@ -57,7 +56,6 @@ clix/
 
 ### Key Design Points
 
-- **`clix-agent` (Local Agent Control):** Recognizes built-in (including Pi and Oh My Pi) and configured custom developer-agent processes, lists native provider sessions independently of live processes, associates live processes with persisted project/usage data, and reports only persisted token/cost data. `tui.rs` owns responsive Ratatui top/session views, selection, search, details, and destructive-action confirmation. Session deletion is provider-aware, removes known sidecars and native indexes, rejects running sessions, and keeps filesystem traversal inside provider-owned roots. Process termination still revalidates identity, and resume uses native argv without a shell.
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
 - **`clix-media` (Shared Media Infrastructure):** Owns bounded concurrent downloads, per-request headers, 32 MiB response limits, local-file reuse, atomic persistence off the async executor, and best-effort failure reporting behind one batch interface.
 - **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.

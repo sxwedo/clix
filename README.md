@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>A fast, local-first control plane for developer agents.</strong>
+  <strong>A fast, local-first toolkit for feeds, developer platforms, and content.</strong>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 
 ---
 
-`clix` discovers, inspects, and controls developer agents running on your machine. Its local-first core is complemented by durable RSS sync, GitHub exports, and focused content-preservation tools.
+`clix` combines durable RSS sync, GitHub exports, social-media preservation, and focused content utilities behind one local-first command line.
 
 It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
 
@@ -23,7 +23,6 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 
 ## 🌟 Key Features
 
-- 🤖 **Agent Control (`clix agent`)**: Discover Claude Code, Codex, Gemini CLI, OpenCode, Pi, Oh My Pi, Cursor Agent, and configured custom agents; inspect processes and saved sessions, tail logs, watch resources interactively, stop a process safely, or resume a saved session.
 - 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect the local archive, and reliably deliver new or changed entries into Lark Base.
 - 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
 - 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
@@ -38,7 +37,6 @@ It supports **Dual Invocation**: every tool is accessible via the unified dispat
 clix/
 ├── crates/
 │   ├── clix-core/         # Shared UI, filesystem, config loading, and GitHub auth helpers
-│   ├── clix-agent/        # Local agent process discovery, session inspection, and control
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-lark-base/    # Reusable authenticated Lark Base upsert interface
 │   ├── clix-media/        # Bounded concurrent media download and atomic persistence
@@ -57,78 +55,6 @@ clix/
 ---
 
 ## ✨ Available Tools
-
-### 🤖 Agent Control (`clix agent`)
-
-`clix agent` is a local process and session control layer. It does not require a daemon and does not upload process or conversation data. Built-in adapters recognize Claude Code, Codex, Gemini CLI, OpenCode, Pi, Oh My Pi (`omp`), and the Cursor Agent CLI.
-
-```sh
-# List running agents. The ID column is accepted by inspect, logs, and stop.
-clix agent ps
-clix agent ps --json
-
-# Responsive CPU/memory TUI: ↑/↓ or j/k select, Enter/i shows a bounded
-# details panel, r refreshes immediately, and q exits. Pipes render once.
-clix agent top
-clix agent top --interval 3 --iterations 5
-
-# Open the interactive session manager. It shows a title/summary and supports
-# / search, Enter/i details, r resume, and d followed by y permanent deletion.
-clix agent sessions
-clix agent sessions --provider claude --limit 20
-# Force the non-interactive table; non-terminals select this automatically.
-clix agent sessions --plain
-clix agent sessions --json
-
-# Inspect a live process or an archived session.
-clix agent inspect codex:12345
-clix agent inspect codex:019abcde-session-id
-
-# Show a compact, one-line event tail; opt into original JSONL records.
-clix agent logs claude:session-id -n 100
-clix agent logs claude:session-id -n 20 --raw
-
-# SIGTERM after PID/start-time/type revalidation; --force uses a forceful kill.
-clix agent stop claude:12345
-clix agent stop claude:12345 --force
-
-# Open an interactive saved-session picker, or select the newest session.
-clix agent resume
-clix agent resume --last
-clix agent resume --list --limit 20
-
-# Resume a known target through the provider's native CLI, without a shell.
-clix agent resume codex:session-id
-clix agent resume omp:session-id
-clix agent resume cursor:chat-id
-```
-
-The process table exposes `ID`, `AGENT`, `PROJECT`, `STATUS`, `DURATION`, `TOKENS`, and `COST`; `top` adds CPU and memory. Status is derived from the operating system process state. clix associates a live process with its newest matching local session and uses the session project when a GUI host reports an unhelpful root working directory. A `-` means no session could be associated; `n/a` means a session was associated but the provider did not persist an exact cost. clix never estimates cost from public model prices.
-
-Session metadata and logs are read from each provider's native local store. `sessions` indexes lightweight metadata without requiring a live process, so closed Claude Code, Codex, Pi, and Oh My Pi sessions remain discoverable and resumable. Titles come from native provider metadata when available and otherwise fall back to the first user message. Permanent deletion removes every catalog path with the same provider/session ID plus known native sidecars and indexes; Claude history and Codex SQLite/JSONL index records are cleaned as well. The confirmation explicitly requires `y`, cannot be undone, and is refused for a session currently matched to a running agent.
-
-Token/cost usage is calculated only for associated or explicitly inspected sessions, and the interactive view caches usage until a session file changes. `logs` bounds individual record size and its retained tail, while `--raw` deliberately exposes the original selected records.
-
-Custom agents use exact executable names plus optional argv markers. The resume command is an argv array with a required `{session}` placeholder, so it never passes configuration through a shell:
-
-```toml
-[agent.custom.my_agent]
-executables = ["my-agent", "my-agent.exe"]
-command_contains = ["--agent-mode"]
-resume = ["my-agent", "resume", "{session}"]
-```
-
-Then use the same stable selectors:
-
-```sh
-clix agent inspect my_agent:12345
-clix agent stop my_agent:12345
-clix agent resume my_agent:session-id
-```
-
-Custom process discovery, stop, and resume are supported. Custom archived-session inspection and logs require a future session-store adapter and therefore fail with an explicit message rather than guessing a path.
-
----
 
 ### 📰 RSS Utilities (`clix rss`)
 
@@ -369,7 +295,7 @@ clix x read https://x.com/user/status/123456789
 
 ## ⚙️ Configuration
 
-Custom Agent definitions, credentials, RSS subscriptions, and sync defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
+Credentials, RSS subscriptions, and sync defaults are externalized to a central config file at `~/.config/clix/config.toml` (honors `XDG_CONFIG_HOME`). Bootstrap a commented template in one step:
 
 ```sh
 clix config init   # creates ~/.config/clix/config.toml (mode 0600)
@@ -389,11 +315,6 @@ The generated file is self-documenting:
 # auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # X (Twitter) CSRF cookie `ct0`.
 # ct0 = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-# [agent.custom.my_agent]
-# executables = ["my-agent"]
-# command_contains = ["--agent-mode"]
-# resume = ["my-agent", "resume", "{session}"]
 
 # [lark.accounts.default]
 # app_id = "cli_xxxxxxxxxxxxxxxx"
@@ -470,7 +391,6 @@ cargo build --workspace --release
 
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
-# - clix-agent         (Standalone local developer-agent control)
 # - clix-rss-list      (Standalone local RSS archive list)
 # - clix-rss-sync      (Standalone RSS redb sync and configured delivery)
 # - clix-wx-read       (Standalone WeChat Article CLI)
