@@ -1,0 +1,16 @@
+[package]
+name = "clix-read"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Unified URL reader for X and WeChat content"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clix-core = { path = "../clix-core" }
+clix-wx-read = { path = "../clix-wx-read" }
+clix-x-read = { path = "../clix-x-read" }
+reqwest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -64,7 +64,7 @@ pub async fn run(args: ReadArgs, settings: &clix_core::settings::Settings) -> Re
         bail!(
             "Missing X authentication credentials!\n\n\
              Provide them via (highest priority first):\n  \
-             • CLI flags:  clix x read <URL> --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n  \
+             • CLI flags:  clix read <X-URL> --auth-token \"<auth_token>\" --ct0 \"<ct0>\"\n  \
              • config.toml [x] section (~/.config/clix/config.toml)\n  \
              • env vars:   export X_AUTH_TOKEN=\"...\"; export X_CT0=\"...\""
         );

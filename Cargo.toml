@@ -5,6 +5,7 @@ members = [
     "crates/clix-gh-stars",
     "crates/clix-lark-base",
     "crates/clix-media",
+    "crates/clix-read",
     "crates/clix-rss-api",
     "crates/clix-rss-delivery",
     "crates/clix-rss-list",
@@ -60,6 +61,7 @@ anyhow.workspace = true
 clap.workspace = true
 clix-core = { path = "crates/clix-core" }
 clix-gh-stars = { path = "crates/clix-gh-stars" }
+clix-read = { path = "crates/clix-read" }
 clix-rss-list = { path = "crates/clix-rss-list" }
 clix-rss-sync = { path = "crates/clix-rss-sync" }
 clix-x-bookmarks = { path = "crates/clix-x-bookmarks" }

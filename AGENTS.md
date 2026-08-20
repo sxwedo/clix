@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) and AI agent assista
 `clix` is a fast, local-first toolkit for RSS, GitHub, social media, and content utilities.
 
 It is structured as a **Cargo Workspace**:
-- **Dual Invocation**: User-facing tools run through the unified CLI (`clix gh stars`, `clix rss sync`, `clix rss list`, `clix x bookmarks`, `clix x read`, `clix wx read`) or a standalone binary.
+- **Dual Invocation**: User-facing tools run through the unified CLI (`clix read`, `clix gh stars`, `clix rss sync`, `clix rss list`, `clix x bookmarks`) or a standalone binary. The legacy `clix x read` and `clix wx read` paths remain compatibility entry points.
 - **Zero-Config GitHub Auth**: Falls back through the config file, `GITHUB_TOKEN`/`GH_TOKEN`, then `gh auth token`; usernames come from the config file, the authenticated `gh` account, or `github.user`.
 - **Externalized Configuration**: Credentials and RSS subscriptions live in `~/.config/clix/config.toml` (`clix config init` generates a 0600 template). Credential resolution priority: CLI flags > config file > environment variables > GitHub autodetect.
 
@@ -42,6 +42,7 @@ clix/
   │   ├── clix-gh-stars/      # GitHub stars exporter
   │   ├── clix-lark-base/     # Shared authenticated Lark Base schema and upsert interface
   │   ├── clix-media/         # Bounded concurrent media download and atomic persistence
+  │   ├── clix-read/          # Unified source detection and X/WeChat reader routing
   │   ├── clix-rss-api/       # Shared subscription selection, bounded fetching, and normalized models
   │   ├── clix-rss-delivery/  # Internal reliable delivery to configured destinations
   │   ├── clix-rss-list/      # Compact terminal view of stored RSS entries
@@ -58,6 +59,7 @@ clix/
 
 - **`clix-core` (Shared Infrastructure):** Provides shared terminal UI, atomic filesystem writes, `settings.rs` for `~/.config/clix/config.toml` loading, and credential resolution that merges CLI flags, the config file, and GitHub autodetect.
 - **`clix-media` (Shared Media Infrastructure):** Owns bounded concurrent downloads, per-request headers, 32 MiB response limits, local-file reuse, atomic persistence off the async executor, and best-effort failure reporting behind one batch interface.
+- **`clix-read` (Unified Reader):** Exposes `clix read <URL>` and `clix-read`, detects supported X/WeChat URLs without fallback probing, requires `--source` for ambiguous bare IDs, validates source-specific options, and routes into the existing reader implementations.
 - **`clix-rss-api` (Shared RSS Infrastructure):** Owns subscription selection, URL validation, bounded concurrent fetching, active-HTML sanitization, and normalized feed/entry models.
 - **`clix-lark-base` (Shared Lark Infrastructure):** Owns tenant authentication, schema discovery, checkpoint-aware record lookup, paginated fallback reconciliation, sequential bounded batches, transient-write retries, and create/update/unchanged planning behind one typed upsert interface.
 - **`clix-rss-store` (RSS Persistence):** Hides the redb table and serialization schema behind `open`, `open_or_create`, `upsert_feeds`, `query`, and delivery checkpoint updates. Each record's extensible `extra` envelope carries per-destination delivery state while RSS refreshes preserve it.

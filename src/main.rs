@@ -7,7 +7,7 @@ use clix_gh_stars::StarsArgs;
 use clix_rss_list::ListArgs;
 use clix_rss_sync::SyncArgs;
 use clix_x_bookmarks::BookmarksArgs;
-use clix_x_read::ReadArgs;
+use clix_x_read::ReadArgs as XReadArgs;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,6 +24,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Read an X status or WeChat article URL into a local document
+    Read(clix_read::ReadArgs),
     /// GitHub developer tools & utilities
     Gh {
         #[command(subcommand)]
@@ -70,7 +72,7 @@ enum XCommands {
     /// Export all bookmarked tweets for an X account (Markdown, URLs, JSON)
     Bookmarks(BookmarksArgs),
     /// Download and convert a single X status URL/ID into a local Markdown/MDX file
-    Read(ReadArgs),
+    Read(XReadArgs),
 }
 #[derive(Debug, Subcommand)]
 enum WxCommands {
@@ -91,6 +93,7 @@ fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Commands::Read(args) => run_async(async move { clix_read::run(args).await }),
         Commands::Config { command } => run_config(command),
         Commands::Gh { command } => {
             let settings = clix_core::settings::Settings::load()?;
@@ -150,12 +153,52 @@ fn run_async(future: impl Future<Output = Result<()>>) -> Result<()> {
 mod tests {
     use clap::{CommandFactory, Parser};
     use clix_gh_stars::OutputFormat;
+    use clix_read::{ReadOutputFormat, ReadSource};
 
     use super::{Cli, Commands, GhCommands, RssCommands, WxCommands};
 
     #[test]
     fn command_tree_is_internally_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn parses_the_documented_unified_read_invocation() {
+        let cli = Cli::try_parse_from([
+            "clix",
+            "read",
+            "https://x.com/alice/status/123456",
+            "--format",
+            "mdx",
+            "--output",
+            "article.mdx",
+            "--no-media",
+            "--include-replies",
+        ])
+        .expect("documented unified read arguments should parse");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Read(args)
+                if args.url_or_id == "https://x.com/alice/status/123456"
+                    && args.source.is_none()
+                    && args.format == ReadOutputFormat::Mdx
+                    && args.output.as_deref() == Some(std::path::Path::new("article.mdx"))
+                    && args.no_media
+                    && args.include_replies
+        ));
+    }
+
+    #[test]
+    fn parses_unified_read_with_an_explicit_source() {
+        let cli = Cli::try_parse_from(["clix", "read", "abcdef", "--source", "wx"])
+            .expect("bare IDs should parse with an explicit source");
+
+        assert!(matches!(
+            cli.command,
+            Commands::Read(args)
+                if args.url_or_id == "abcdef" && args.source == Some(ReadSource::Wechat)
+        ));
     }
 
     #[test]

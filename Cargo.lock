@@ -250,6 +250,7 @@ dependencies = [
  "clap",
  "clix-core",
  "clix-gh-stars",
+ "clix-read",
  "clix-rss-list",
  "clix-rss-sync",
  "clix-wx-read",
@@ -308,6 +309,19 @@ dependencies = [
  "tempfile",
  "tokio",
  "wiremock",
+]
+
+[[package]]
+name = "clix-read"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clix-core",
+ "clix-wx-read",
+ "clix-x-read",
+ "reqwest",
+ "tokio",
 ]
 
 [[package]]

@@ -17,15 +17,16 @@
 
 `clix` combines durable RSS sync, GitHub exports, social-media preservation, and focused content utilities behind one local-first command line.
 
-It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix <service> <command>`) or as a standalone binary (`clix-<service>-<command>`).
+It supports **Dual Invocation**: every tool is accessible via the unified dispatcher (`clix read`, `clix <service> <command>`) or as a standalone binary (`clix-read`, `clix-<service>-<command>`).
 
 ---
 
 ## 🌟 Key Features
 
 - 📰 **RSS Tools (`clix rss`)**: Incrementally sync RSS, Atom, or JSON Feed entries into redb, inspect the local archive, and reliably deliver new or changed entries into Lark Base.
-- 🟢 **WeChat Article Reader (`clix wx read`)**: Convert WeChat Official Account articles into clean Markdown/MDX files. Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
-- 🐦 **X (Twitter) Bookmarks & Reader (`clix x`)**: Incremental sync of X bookmarks to Markdown/JSON, and download single X posts/articles with local media assets.
+- 📖 **Universal Content Reader (`clix read`)**: Give clix an X status or WeChat article URL and let it select the matching reader, then save clean Markdown, MDX, or JSON with optional local media.
+- 🟢 **WeChat Article Support**: Downloads images locally, bypasses hotlink protection (`403 Forbidden`), and intelligently cleans up WeChat code blocks and pseudo-headings.
+- 🐦 **X (Twitter) Bookmarks (`clix x bookmarks`)**: Incrementally sync X bookmarks to Markdown/JSON; the universal reader also supports single X posts, articles, and reply threads.
 - 🐙 **Zero-Config GitHub Star Exporter (`clix gh stars`)**: Asynchronously export starred repositories with auto-detected `gh` auth credentials or a central config file.
 - 🚀 **Bounded & Efficient**: Powered by Rust 2024 and Tokio async I/O, with explicit concurrency and response-size limits on network-heavy paths.
 
@@ -40,6 +41,7 @@ clix/
 │   ├── clix-gh-stars/     # GitHub starred-repository exporter
 │   ├── clix-lark-base/    # Reusable authenticated Lark Base upsert interface
 │   ├── clix-media/        # Bounded concurrent media download and atomic persistence
+│   ├── clix-read/         # Unified URL routing and reader interface
 │   ├── clix-rss-api/      # Shared RSS selection, fetching, and normalization
 │   ├── clix-rss-delivery/ # Internal reliable delivery to configured destinations
 │   ├── clix-rss-list/     # Compact terminal view of stored RSS entries
@@ -209,9 +211,35 @@ The former public `fetch`, `push`, and `export` commands are not currently suppo
 
 ---
 
+### 📖 Universal Content Reader (`clix read` / `clix-read`)
+
+Read a supported URL into a local Markdown, MDX, or JSON document. `clix` selects the reader deterministically from the URL host: `x.com` and `twitter.com` use the X reader, while `mp.weixin.qq.com` uses the WeChat reader.
+
+```sh
+# Source is inferred from a full URL
+clix read "https://x.com/user/status/123456789"
+clix read "https://mp.weixin.qq.com/s/abcdef123456"
+
+# Common output controls work across sources
+clix read "https://mp.weixin.qq.com/s/abcdef123456" --format mdx --no-media
+
+# Bare IDs need an explicit source because they are ambiguous
+clix read 123456789 --source x
+clix read abcdef123456 --source wechat
+
+# The standalone unified binary exposes the same interface
+clix-read "https://x.com/user/status/123456789" -o ./status.md
+```
+
+Unsupported hosts fail without attempting another reader. X-only options such as `--include-replies`, `--auth-token`, and `--ct0` are rejected for WeChat inputs.
+
+The former `clix x read` and `clix wx read` command paths remain available as compatibility entry points.
+
+---
+
 ### 🟢 WeChat Utilities (`clix wx`)
 
-#### 📖 `clix wx read` / `clix-wx-read` — WeChat Article Exporter
+#### 📖 `clix read <WECHAT-URL>` / `clix-wx-read` — WeChat Article Exporter
 
 Download any WeChat Official Account article by URL or ID and convert it into a standalone Markdown, MDX, or JSON file.
 
@@ -224,13 +252,13 @@ Download any WeChat Official Account article by URL or ID and convert it into a 
 
 ```sh
 # Export a WeChat article to Markdown (with local images) via unified CLI
-clix wx read "https://mp.weixin.qq.com/s/abcdef123456"
+clix read "https://mp.weixin.qq.com/s/abcdef123456"
 
 # Via standalone binary with custom output path
 clix-wx-read "https://mp.weixin.qq.com/s/abcdef123456" -o ./my_article.md
 
 # Export as MDX format without downloading images
-clix wx read "https://mp.weixin.qq.com/s/abcdef123456" --format mdx --no-media
+clix read "https://mp.weixin.qq.com/s/abcdef123456" --format mdx --no-media
 ```
 
 ---
@@ -281,14 +309,15 @@ clix x bookmarks --incremental -o my_bookmarks.md
 clix x bookmarks --auth-token "<token>" --ct0 "<ct0>" --incremental
 ```
 
-#### 📖 `clix x read` / `clix-x-read` — X Status and Article Reader
+#### 📖 `clix read <X-URL>` / `clix-x-read` — X Status and Article Reader
 
 Download one X status or Article by URL or Tweet ID and convert it to Markdown, MDX, or JSON with local media files.
 
 ##### Usage
 
 ```sh
-clix x read https://x.com/user/status/123456789
+clix read https://x.com/user/status/123456789
+clix read https://x.com/user/status/123456789 --include-replies
 ```
 
 ---
@@ -391,6 +420,7 @@ cargo build --workspace --release
 
 # Binaries generated in target/release/:
 # - clix               (Unified CLI dispatcher)
+# - clix-read          (Standalone unified URL reader)
 # - clix-rss-list      (Standalone local RSS archive list)
 # - clix-rss-sync      (Standalone RSS redb sync and configured delivery)
 # - clix-wx-read       (Standalone WeChat Article CLI)

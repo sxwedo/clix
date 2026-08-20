@@ -463,7 +463,7 @@ fn collect_media_subtypes(target: &Value, subtypes: &mut Vec<ContentSubtype>) {
     }
 }
 
-/// Backwards-compatible single-value type emitted by `clix x read`.
+/// Backwards-compatible single-value type emitted by `clix read` and legacy `clix x read`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LegacyTweetType {
     Article,
